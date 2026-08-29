@@ -106,11 +106,41 @@ def get_bulk_deals():
         # reports; collapse those into a single row per unique trade.
         combined = combined.drop_duplicates(subset=["Symbol", "Date", "Value_Cr", "Buyer_Seller"], keep="first")
 
-        combined = combined[["Company", "Symbol", "Type", "Value_Cr", "Buyer_Seller", "Date"]]
+        combined = combined[["Company", "Symbol", "Type", "Value_Cr", "Qty", "Buyer_Seller", "Date"]]
         combined = combined.sort_values("Value_Cr", ascending=False).reset_index(drop=True)
         return combined, None
     except Exception as e:
         return None, f"Could not fetch live NSE data ({e})."
+
+# ============= SMART MONEY AGGREGATIONS =============
+def build_leaderboard(df, side):
+    """Rank entities by total value on the Buy or Sell side."""
+    sub = df[df["Type"].str.startswith(side)]
+    if sub.empty:
+        return pd.DataFrame(columns=["Entity", f"Total {side} Value (₹ Cr)", "Total Quantity", "No. of Deals", "Stocks Involved"])
+    agg = sub.groupby("Buyer_Seller").agg(
+        Value_Cr=("Value_Cr", "sum"),
+        Qty=("Qty", "sum"),
+        Deals=("Symbol", "count"),
+        Stocks=("Symbol", lambda x: ", ".join(sorted(set(x))[:6]) + ("…" if len(set(x)) > 6 else "")),
+    ).reset_index()
+    agg.columns = ["Entity", f"Total {side} Value (₹ Cr)", "Total Quantity", "No. of Deals", "Stocks Involved"]
+    return agg.sort_values(f"Total {side} Value (₹ Cr)", ascending=False).reset_index(drop=True)
+
+def build_stock_flow(df):
+    """Net Buy-vs-Sell value and quantity per stock, to spot accumulation/distribution."""
+    if df.empty:
+        return pd.DataFrame(columns=["Symbol", "Buy Value (₹ Cr)", "Sell Value (₹ Cr)", "Net Value (₹ Cr)", "Net Quantity"])
+    buy = df[df["Type"].str.startswith("Buy")].groupby("Symbol").agg(Buy_Value=("Value_Cr", "sum"), Buy_Qty=("Qty", "sum"))
+    sell = df[df["Type"].str.startswith("Sell")].groupby("Symbol").agg(Sell_Value=("Value_Cr", "sum"), Sell_Qty=("Qty", "sum"))
+    flow = buy.join(sell, how="outer").fillna(0)
+    flow["Net_Value"] = flow["Buy_Value"] - flow["Sell_Value"]
+    flow["Net_Qty"] = flow["Buy_Qty"] - flow["Sell_Qty"]
+    flow = flow.reset_index().rename(columns={
+        "Buy_Value": "Buy Value (₹ Cr)", "Sell_Value": "Sell Value (₹ Cr)",
+        "Net_Value": "Net Value (₹ Cr)", "Net_Qty": "Net Quantity",
+    })
+    return flow.sort_values("Net Value (₹ Cr)", ascending=False).reset_index(drop=True)
 
 # ============= STOCK DATA =============
 @st.cache_data(ttl=300)
@@ -154,14 +184,14 @@ def main():
         if st.button("🔄 Refresh All Data", use_container_width=True):
             st.cache_data.clear(); st.rerun()
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📌 Tenders", "💹 Bulk Deals", "📊 Analysis", "🎯 Top Picks"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Tenders", "💹 Bulk Deals", "📊 Analysis", "🎯 Top Picks", "🧠 Smart Money Tracker"])
 
     tenders = get_tenders()
     bulk_deals, bulk_error = get_bulk_deals()
     if bulk_error is not None:
         # Fall back to empty frame with the right schema so the rest of the
         # app (Analysis/Top Picks lookups) doesn't crash
-        bulk_deals = pd.DataFrame(columns=["Company", "Symbol", "Type", "Value_Cr", "Buyer_Seller", "Date"])
+        bulk_deals = pd.DataFrame(columns=["Company", "Symbol", "Type", "Value_Cr", "Qty", "Buyer_Seller", "Date"])
 
     with st.sidebar:
         st.markdown("---")
@@ -202,10 +232,12 @@ def main():
             st.info("No bulk/block deals reported for the latest NSE session yet.")
         else:
             st.caption(f"Source: NSE archives • fetched {datetime.now().strftime('%d %b %Y, %H:%M')} • cached 30 min")
-            deals = bulk_deals.head(10)
+            deals = bulk_deals.head(10).copy()
+            deals["Qty"] = deals["Qty"].map(lambda x: f"{int(x):,}")
             styled = deals.style.apply(lambda x: ['background: #d4edda' if x['Type'].startswith('Buy') else 'background: #f8d7da' for _ in x], axis=1)
             st.dataframe(styled, use_container_width=True)
             st.info("🟢 Buy = Institutional/Promoter confidence • 🔴 Sell = Caution")
+            st.caption("👉 For buyer/seller leaderboards, quantities, and full accumulation/distribution analysis, see the **🧠 Smart Money Tracker** tab.")
 
     with tab3:
         st.markdown("### 📊 AI Analysis Report")
@@ -241,6 +273,90 @@ def main():
             if 'WATCHLIST' in val: return 'background: #ffab00; color: black;'
             return ''
         st.dataframe(df.style.map(color, subset=["Rec"]), use_container_width=True)
+
+    with tab5:
+        st.markdown("### 🧠 Smart Money Tracker — Who's Buying, Who's Selling")
+        st.caption(f"Source: NSE bulk & block deal archives • {datetime.now().strftime('%d %b %Y, %H:%M')} • cached 30 min")
+
+        if bulk_error:
+            st.error(f"⚠️ {bulk_error} No fake data shown.")
+        elif bulk_deals.empty:
+            st.info("No bulk/block deals reported for the latest NSE session yet.")
+        else:
+            buy_total = bulk_deals.loc[bulk_deals["Type"].str.startswith("Buy"), "Value_Cr"].sum()
+            sell_total = bulk_deals.loc[bulk_deals["Type"].str.startswith("Sell"), "Value_Cr"].sum()
+            k1, k2, k3, k4 = st.columns(4)
+            with k1: st.metric("💰 Total Buy Value", f"₹{buy_total:,.0f} Cr")
+            with k2: st.metric("📤 Total Sell Value", f"₹{sell_total:,.0f} Cr")
+            with k3: st.metric("⚖️ Net Flow", f"₹{buy_total - sell_total:,.0f} Cr")
+            with k4: st.metric("📄 Total Deals", f"{len(bulk_deals)}")
+
+            st.markdown("---")
+            sub_buyers, sub_sellers, sub_accum, sub_dist, sub_all = st.tabs(
+                ["🟢 Top Buyers", "🔴 Top Sellers", "📈 Top Accumulation", "📉 Top Distribution", "📋 All Deals"]
+            )
+
+            with sub_buyers:
+                st.markdown("#### Entities buying the most, by value")
+                buyers = build_leaderboard(bulk_deals, "Buy")
+                if buyers.empty:
+                    st.info("No buy-side deals found.")
+                else:
+                    display = buyers.head(15).copy()
+                    display["Total Quantity"] = display["Total Quantity"].map(lambda x: f"{int(x):,}")
+                    st.dataframe(display, use_container_width=True, hide_index=True)
+                    fig = go.Figure(go.Bar(
+                        x=buyers.head(10)["Entity"], y=buyers.head(10).iloc[:, 1],
+                        marker_color="#00c853"
+                    ))
+                    fig.update_layout(title="Top 10 Buyers by Value (₹ Cr)", height=350, margin=dict(t=40, b=10))
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with sub_sellers:
+                st.markdown("#### Entities selling the most, by value")
+                sellers = build_leaderboard(bulk_deals, "Sell")
+                if sellers.empty:
+                    st.info("No sell-side deals found.")
+                else:
+                    display = sellers.head(15).copy()
+                    display["Total Quantity"] = display["Total Quantity"].map(lambda x: f"{int(x):,}")
+                    st.dataframe(display, use_container_width=True, hide_index=True)
+                    fig = go.Figure(go.Bar(
+                        x=sellers.head(10)["Entity"], y=sellers.head(10).iloc[:, 1],
+                        marker_color="#ff1744"
+                    ))
+                    fig.update_layout(title="Top 10 Sellers by Value (₹ Cr)", height=350, margin=dict(t=40, b=10))
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with sub_accum:
+                st.markdown("#### Stocks with the strongest net buying (Buy value > Sell value)")
+                flow = build_stock_flow(bulk_deals)
+                accum = flow[flow["Net Value (₹ Cr)"] > 0].head(15)
+                if accum.empty:
+                    st.info("No stocks show net accumulation in the current data.")
+                else:
+                    st.dataframe(accum, use_container_width=True, hide_index=True)
+
+            with sub_dist:
+                st.markdown("#### Stocks with the strongest net selling (Sell value > Buy value)")
+                flow = build_stock_flow(bulk_deals)
+                dist = flow[flow["Net Value (₹ Cr)"] < 0].sort_values("Net Value (₹ Cr)").head(15)
+                if dist.empty:
+                    st.info("No stocks show net distribution in the current data.")
+                else:
+                    st.dataframe(dist, use_container_width=True, hide_index=True)
+
+            with sub_all:
+                st.markdown("#### Every individual deal (raw data)")
+                full = bulk_deals.copy()
+                full["Qty"] = full["Qty"].map(lambda x: f"{int(x):,}")
+                st.dataframe(full, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ Download full deals as CSV",
+                    data=bulk_deals.to_csv(index=False).encode("utf-8"),
+                    file_name=f"nse_bulk_block_deals_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                )
 
 if __name__ == "__main__":
     main()
