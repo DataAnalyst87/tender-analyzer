@@ -1,6 +1,63 @@
-streamlit
-pandas
-yfinance
-plotly
-requests
-nsefeed
+@st.cache_data(ttl=3600)
+def fetch_nse_bulk_deals(days=7):
+    """Fetch bulk deals using nsefeed — works on Streamlit Cloud"""
+    try:
+        all_deals = []
+        
+        for i in range(days):
+            date = datetime.now() - timedelta(days=i)
+            if date.weekday() >= 5:
+                continue
+            
+            try:
+                # nsefeed se bulk deals fetch [citation:9]
+                data = nf.equity.get_bulk_deal_data(date.strftime("%d-%m-%Y"))
+                if data is not None and not data.empty:
+                    data['Date'] = date.strftime("%Y-%m-%d")
+                    all_deals.append(data)
+            except:
+                pass
+        
+        if not all_deals:
+            return pd.DataFrame(), "No bulk deals found"
+        
+        combined = pd.concat(all_deals, ignore_index=True)
+        
+        # Column names normalize karo
+        col_map = {}
+        for col in combined.columns:
+            col_upper = col.upper()
+            if 'SYMBOL' in col_upper:
+                col_map[col] = 'Symbol'
+            elif 'SECURITY' in col_upper or 'COMPANY' in col_upper:
+                col_map[col] = 'Company'
+            elif 'CLIENT' in col_upper:
+                col_map[col] = 'Buyer_Seller'
+            elif 'BUY' in col_upper and 'SELL' in col_upper:
+                col_map[col] = 'Type'
+            elif 'QUANTITY' in col_upper:
+                col_map[col] = 'Qty'
+            elif 'PRICE' in col_upper:
+                col_map[col] = 'Price'
+        
+        combined = combined.rename(columns=col_map)
+        
+        required = ['Symbol', 'Company', 'Buyer_Seller', 'Type', 'Qty', 'Price']
+        for col in required:
+            if col not in combined.columns:
+                combined[col] = 'N/A'
+        
+        combined['Qty'] = pd.to_numeric(combined['Qty'], errors='coerce').fillna(0)
+        combined['Price'] = pd.to_numeric(combined['Price'], errors='coerce').fillna(0)
+        combined['Value_Cr'] = (combined['Qty'] * combined['Price'] / 1e7).round(2)
+        
+        combined['Type'] = combined['Type'].astype(str).str.upper()
+        combined['Type'] = combined['Type'].apply(
+            lambda x: 'Buy' if 'BUY' in x else 'Sell' if 'SELL' in x else 'Unknown'
+        )
+        combined = combined[combined['Type'] != 'Unknown']
+        
+        return combined, None
+        
+    except Exception as e:
+        return None, f"Error: {str(e)}"
