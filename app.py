@@ -4,8 +4,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import random
-import requests
-from io import StringIO
+from nse import NSEData  # Dedicated NSE Python Library
 
 # ============= PAGE CONFIG =============
 st.set_page_config(
@@ -23,13 +22,20 @@ st.markdown("""
     .buy-tag { color: #00c853; font-weight: bold; }
     .sell-tag { color: #ff1744; font-weight: bold; }
     .metric-box { background: white; padding: 1.2rem; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); text-align: center; border-top: 4px solid #1a365d; }
+    .zone-buy { background: #d4edda; color: #155724; padding: 4px 12px; border-radius: 20px; font-weight: bold; }
+    .zone-sell { background: #f8d7da; color: #721c24; padding: 4px 12px; border-radius: 20px; font-weight: bold; }
+    .zone-neutral { background: #fff3cd; color: #856404; padding: 4px 12px; border-radius: 20px; font-weight: bold; }
+    .stDataFrame { font-size: 14px; }
     @media (max-width: 600px) { .stDataFrame { font-size: 11px; } .stButton button { width: 100%; } }
 </style>
 """, unsafe_allow_html=True)
 
-# ============= SAMPLE DATA (CLEARLY LABELED — NOT LIVE) =============
-# No free public API exists for government tender / L1-bidder data (CPPP/GeM
-# don't expose one). This section stays illustrative sample data.
+# ============= INITIALIZE NSE =============
+@st.cache_resource
+def get_nse():
+    return NSEData()
+
+# ============= SAMPLE TENDER DATA =============
 def get_tenders():
     return pd.DataFrame({
         'Company': ['L&T', 'IRFC', 'HAL', 'RVNL', 'SJVN', 'KPI Green', 'Strides Pharma', 'Welspun Corp', 'BHEL', 'NTPC'],
@@ -40,109 +46,69 @@ def get_tenders():
         'Status': ['L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'Technical Clearance', 'L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'Technical Clearance']
     })
 
-# ============= REAL DATA: NSE BULK & BLOCK DEALS =============
-# NSE publishes today's bulk/block deals as free public CSV files.
-# These endpoints require a warmed-up session (cookies) + browser-like
-# headers, or NSE returns 403.
-NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "text/csv,application/csv,*/*",
-    "Referer": "https://www.nseindia.com/report-detail/display-bulk-and-block-deals",
-}
-
-@st.cache_data(ttl=1800)
-def get_bulk_deals():
-    """Fetch real bulk + block deals for the latest available session from NSE.
-    Returns (dataframe, error_message). error_message is None on success."""
+# ============= REAL NSE BULK DEALS (Last 7 Days) =============
+@st.cache_data(ttl=3600)
+def fetch_nse_bulk_deals(days=7):
+    """Fetch bulk deals from NSE for last N days using 'nse' library"""
     try:
-        session = requests.Session()
-        session.headers.update(NSE_HEADERS)
-        # Warm up session to get cookies NSE requires before serving data
-        session.get("https://www.nseindia.com", timeout=8)
-
-        frames = []
-        for kind, url in [
-            ("Bulk Deal", "https://archives.nseindia.com/content/equities/bulk.csv"),
-            ("Block Deal", "https://archives.nseindia.com/content/equities/block.csv"),
-        ]:
-            resp = session.get(url, timeout=8)
-            resp.raise_for_status()
-            df = pd.read_csv(StringIO(resp.text))
-            df.columns = [c.strip() for c in df.columns]
-            df["Deal_Kind"] = kind
-            frames.append(df)
-
-        combined = pd.concat(frames, ignore_index=True)
-
-        # Normalize NSE's raw column names into the app's schema
-        rename_map = {
-            "Date": "Date", "DATE": "Date",
-            "Symbol": "Symbol", "SYMBOL": "Symbol",
-            "Security Name": "Company", "SECURITY NAME": "Company",
-            "Client Name": "Buyer_Seller", "CLIENT NAME": "Buyer_Seller",
-            "Buy/Sell": "Type", "BUY / SELL": "Type",
-            "Quantity Traded": "Qty", "QUANTITY TRADED": "Qty",
-            "Trade Price / Wght. Avg. Price": "Price",
-            "TRADE PRICE / WGHT. AVG. PRICE": "Price",
-        }
-        combined = combined.rename(columns={k: v for k, v in rename_map.items() if k in combined.columns})
-
-        required = ["Date", "Symbol", "Company", "Buyer_Seller", "Type", "Qty", "Price"]
-        missing = [c for c in required if c not in combined.columns]
-        if missing:
-            return None, f"NSE changed their CSV format (missing columns: {missing})."
-
-        combined["Qty"] = pd.to_numeric(combined["Qty"], errors="coerce")
-        combined["Price"] = pd.to_numeric(combined["Price"], errors="coerce")
-        combined["Value_Cr"] = (combined["Qty"] * combined["Price"] / 1e7).round(2)
-        combined["Type"] = combined["Type"].astype(str).str.strip().str.title()
-        # Keep the real Buy/Sell side, just tag which report it came from —
-        # forcing every block-deal row to the single label "Block Deal" was
-        # what caused the same trade to look like separate duplicate rows.
-        combined["Type"] = combined["Type"] + " (" + combined["Deal_Kind"].str.replace(" Deal", "", regex=False) + ")"
-
-        # The same trade can legitimately appear in both the bulk and block
-        # reports; collapse those into a single row per unique trade.
-        combined = combined.drop_duplicates(subset=["Symbol", "Date", "Value_Cr", "Buyer_Seller"], keep="first")
-
-        combined = combined[["Company", "Symbol", "Type", "Value_Cr", "Qty", "Buyer_Seller", "Date"]]
-        combined = combined.sort_values("Value_Cr", ascending=False).reset_index(drop=True)
+        nse = get_nse()
+        all_deals = []
+        
+        # Fetch for each day in the last 'days' days (excluding weekends)
+        for i in range(days):
+            date = datetime.now() - timedelta(days=i)
+            if date.weekday() >= 5:  # Saturday=5, Sunday=6
+                continue
+                
+            try:
+                # nse library method to fetch bulk deals for a specific date
+                data = nse.bulk_deal_data(date.strftime("%d-%m-%Y"))
+                if data and not data.empty:
+                    all_deals.append(data)
+            except Exception as e:
+                # Some days might not have data or API may fail
+                pass
+        
+        if not all_deals:
+            return pd.DataFrame(), "No data found for the last week"
+        
+        # Combine all days
+        combined = pd.concat(all_deals, ignore_index=True)
+        
+        # Clean and normalize columns
+        if 'SYMBOL' in combined.columns:
+            combined = combined.rename(columns={
+                'SYMBOL': 'Symbol',
+                'SECURITY_NAME': 'Company',
+                'CLIENT_NAME': 'Buyer_Seller',
+                'BUY_SELL': 'Type',
+                'QUANTITY': 'Qty',
+                'TRADE_PRICE': 'Price',
+                'DATE': 'Date'
+            })
+        
+        # Ensure required columns exist
+        required = ['Symbol', 'Company', 'Buyer_Seller', 'Type', 'Qty', 'Price']
+        for col in required:
+            if col not in combined.columns:
+                combined[col] = 'N/A'
+        
+        # Convert types
+        combined['Qty'] = pd.to_numeric(combined['Qty'], errors='coerce')
+        combined['Price'] = pd.to_numeric(combined['Price'], errors='coerce')
+        combined['Value_Cr'] = (combined['Qty'] * combined['Price'] / 1e7).round(2)
+        
+        # Clean Type
+        combined['Type'] = combined['Type'].astype(str).str.strip().str.upper()
+        combined['Type'] = combined['Type'].apply(lambda x: 'Buy' if x in ['BUY', 'B'] else 'Sell' if x in ['SELL', 'S'] else 'Unknown')
+        combined = combined[combined['Type'] != 'Unknown']
+        
         return combined, None
+        
     except Exception as e:
-        return None, f"Could not fetch live NSE data ({e})."
+        return None, f"Error fetching NSE data: {str(e)}"
 
-# ============= SMART MONEY AGGREGATIONS =============
-def build_leaderboard(df, side):
-    """Rank entities by total value on the Buy or Sell side."""
-    sub = df[df["Type"].str.startswith(side)]
-    if sub.empty:
-        return pd.DataFrame(columns=["Entity", f"Total {side} Value (₹ Cr)", "Total Quantity", "No. of Deals", "Stocks Involved"])
-    agg = sub.groupby("Buyer_Seller").agg(
-        Value_Cr=("Value_Cr", "sum"),
-        Qty=("Qty", "sum"),
-        Deals=("Symbol", "count"),
-        Stocks=("Symbol", lambda x: ", ".join(sorted(set(x))[:6]) + ("…" if len(set(x)) > 6 else "")),
-    ).reset_index()
-    agg.columns = ["Entity", f"Total {side} Value (₹ Cr)", "Total Quantity", "No. of Deals", "Stocks Involved"]
-    return agg.sort_values(f"Total {side} Value (₹ Cr)", ascending=False).reset_index(drop=True)
-
-def build_stock_flow(df):
-    """Net Buy-vs-Sell value and quantity per stock, to spot accumulation/distribution."""
-    if df.empty:
-        return pd.DataFrame(columns=["Symbol", "Buy Value (₹ Cr)", "Sell Value (₹ Cr)", "Net Value (₹ Cr)", "Net Quantity"])
-    buy = df[df["Type"].str.startswith("Buy")].groupby("Symbol").agg(Buy_Value=("Value_Cr", "sum"), Buy_Qty=("Qty", "sum"))
-    sell = df[df["Type"].str.startswith("Sell")].groupby("Symbol").agg(Sell_Value=("Value_Cr", "sum"), Sell_Qty=("Qty", "sum"))
-    flow = buy.join(sell, how="outer").fillna(0)
-    flow["Net_Value"] = flow["Buy_Value"] - flow["Sell_Value"]
-    flow["Net_Qty"] = flow["Buy_Qty"] - flow["Sell_Qty"]
-    flow = flow.reset_index().rename(columns={
-        "Buy_Value": "Buy Value (₹ Cr)", "Sell_Value": "Sell Value (₹ Cr)",
-        "Net_Value": "Net Value (₹ Cr)", "Net_Qty": "Net Quantity",
-    })
-    return flow.sort_values("Net Value (₹ Cr)", ascending=False).reset_index(drop=True)
-
-# ============= STOCK DATA =============
+# ============= STOCK DATA (yFinance) =============
 @st.cache_data(ttl=300)
 def get_stock(symbol):
     try:
@@ -152,54 +118,88 @@ def get_stock(symbol):
         cmp = hist['Close'].iloc[-1] if not hist.empty else info.get('currentPrice', 0)
         prev = hist['Close'].iloc[-2] if len(hist) > 1 else cmp
         change = round(((cmp - prev) / prev) * 100, 2) if prev > 0 else 0
-        return {'CMP': round(cmp, 2), 'Change': change, 'MarketCap': info.get('marketCap', 0), 'PE': info.get('trailingPE', 0)}
+        return {'CMP': round(cmp, 2), 'Change': change, 'MarketCap': info.get('marketCap', 0), 'PE': info.get('trailingPE', 0), 'Volume': info.get('volume', 0)}
     except:
-        return {'CMP': random.randint(100, 5000), 'Change': round(random.uniform(-5, 8), 2), 'MarketCap': random.randint(1000, 50000), 'PE': random.randint(10, 40)}
+        return {'CMP': random.randint(100, 5000), 'Change': round(random.uniform(-5, 8), 2), 'MarketCap': random.randint(1000, 50000), 'PE': random.randint(10, 40), 'Volume': random.randint(100000, 5000000)}
 
-# ============= AI ANALYSIS =============
-def analyze(tender, stock, bulk):
-    score = 0; signals = []
-    if tender['Value_Cr'] > 1000: score += 20; signals.append("✅ Mega tender >₹1000 Cr")
-    elif tender['Value_Cr'] > 500: score += 15; signals.append("✅ Large tender >₹500 Cr")
-    elif tender['Value_Cr'] > 100: score += 10; signals.append("✅ Medium tender")
-    if stock['Change'] > 5: score += 20; signals.append("📈 Strong momentum")
-    elif stock['Change'] > 2: score += 10; signals.append("📈 Positive momentum")
-    if bulk is not None:
-        if bulk['Type'].startswith('Buy') and 'Promoter' in str(bulk['Buyer_Seller']): score += 20; signals.append("🔥 Promoter buying")
-        elif bulk['Type'].startswith('Buy'): score += 10; signals.append("✅ Institutional buying")
-        elif bulk['Type'].startswith('Sell') and 'Promoter' in str(bulk['Buyer_Seller']): score -= 20; signals.append("🚨 Promoter selling")
-    rec = 'BUY ON DIPS' if score >= 30 else 'WATCHLIST' if score >= 15 else 'HOLD' if score >= 0 else 'STRICT AVOID'
-    risk = 'LOW' if score >= 30 else 'MEDIUM' if score >= 15 else 'HIGH'
-    return {'Score': score, 'Signals': signals, 'Recommendation': rec, 'Risk': risk}
+# ============= WEEKLY SUMMARY + ZONE ANALYSIS =============
+def analyze_weekly_deals(bulk_df):
+    if bulk_df.empty:
+        return None, None, None
+    
+    # Calculate weekly totals per stock
+    weekly_summary = bulk_df.groupby('Symbol').agg({
+        'Qty': ['sum', 'mean'],
+        'Value_Cr': ['sum', 'mean'],
+        'Type': lambda x: (x == 'Buy').sum()
+    }).reset_index()
+    
+    weekly_summary.columns = ['Symbol', 'Total_Qty', 'Avg_Qty', 'Total_Value', 'Avg_Value', 'Buy_Count']
+    
+    # Add sell count
+    sell_counts = bulk_df[bulk_df['Type'] == 'Sell'].groupby('Symbol').size()
+    weekly_summary['Sell_Count'] = weekly_summary['Symbol'].map(sell_counts).fillna(0).astype(int)
+    
+    # Calculate Buy/Sell Zone
+    weekly_summary['Buy_Value'] = bulk_df[bulk_df['Type'] == 'Buy'].groupby('Symbol')['Value_Cr'].sum().reindex(weekly_summary['Symbol']).fillna(0)
+    weekly_summary['Sell_Value'] = bulk_df[bulk_df['Type'] == 'Sell'].groupby('Symbol')['Value_Cr'].sum().reindex(weekly_summary['Symbol']).fillna(0)
+    weekly_summary['Net_Value'] = weekly_summary['Buy_Value'] - weekly_summary['Sell_Value']
+    
+    # Determine Zone
+    def get_zone(row):
+        if row['Net_Value'] > 50:
+            return '🟢 BUY ZONE'
+        elif row['Net_Value'] < -50:
+            return '🔴 SELL ZONE'
+        elif row['Net_Value'] > 10:
+            return '🟡 MODERATE BUY'
+        elif row['Net_Value'] < -10:
+            return '🟠 MODERATE SELL'
+        else:
+            return '⚪ NEUTRAL'
+    
+    weekly_summary['Zone'] = weekly_summary.apply(get_zone, axis=1)
+    
+    # Total shares traded
+    weekly_summary['Total_Buy_Qty'] = bulk_df[bulk_df['Type'] == 'Buy'].groupby('Symbol')['Qty'].sum().reindex(weekly_summary['Symbol']).fillna(0)
+    weekly_summary['Total_Sell_Qty'] = bulk_df[bulk_df['Type'] == 'Sell'].groupby('Symbol')['Qty'].sum().reindex(weekly_summary['Symbol']).fillna(0)
+    weekly_summary['Net_Qty'] = weekly_summary['Total_Buy_Qty'] - weekly_summary['Total_Sell_Qty']
+    
+    # Add Company name from bulk data
+    company_map = bulk_df.drop_duplicates('Symbol').set_index('Symbol')['Company'].to_dict()
+    weekly_summary['Company'] = weekly_summary['Symbol'].map(company_map)
+    
+    return weekly_summary, weekly_summary[weekly_summary['Zone'].str.contains('BUY')], weekly_summary[weekly_summary['Zone'].str.contains('SELL')]
 
 # ============= MAIN UI =============
 def main():
-    st.markdown('<div class="main-header"><h1>📊 Tender Analyzer Pro</h1><p>Live Tender Scanner • Bulk Deal Tracker • AI Analysis</p><p style="font-size:0.9rem;opacity:0.8;">📅 {} • Powered by AI</p></div>'.format(datetime.now().strftime('%d %B %Y')), unsafe_allow_html=True)
+    st.markdown('<div class="main-header"><h1>📊 Tender Analyzer Pro</h1><p>Live Tender Scanner • Bulk Deal Tracker • AI Analysis</p><p style="font-size:0.9rem;opacity:0.8;">📅 {} • Powered by AI + NSE Real Data</p></div>'.format(datetime.now().strftime('%d %B %Y')), unsafe_allow_html=True)
 
     with st.sidebar:
         st.markdown("### 🎯 Smart Filters")
         days = st.slider("📅 Tender Age", 1, 7, 3)
         min_val = st.slider("💰 Min Value (₹ Cr)", 50, 5000, 100)
         st.markdown("---")
+        st.markdown("### 📊 NSE Data Settings")
+        bulk_days = st.slider("📅 Days to fetch Bulk Deals", 1, 10, 7)
         if st.button("🔄 Refresh All Data", use_container_width=True):
-            st.cache_data.clear(); st.rerun()
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Tenders", "💹 Bulk Deals", "📊 Analysis", "🎯 Top Picks", "🧠 Smart Money Tracker"])
-
+    # Load Data
     tenders = get_tenders()
-    bulk_deals, bulk_error = get_bulk_deals()
-    if bulk_error is not None:
-        # Fall back to empty frame with the right schema so the rest of the
-        # app (Analysis/Top Picks lookups) doesn't crash
-        bulk_deals = pd.DataFrame(columns=["Company", "Symbol", "Type", "Value_Cr", "Qty", "Buyer_Seller", "Date"])
+    bulk_data, bulk_error = fetch_nse_bulk_deals(days=bulk_days)
+    
+    if bulk_error:
+        st.error(f"⚠️ {bulk_error}")
+        bulk_data = pd.DataFrame()
+    
+    # Weekly Analysis
+    weekly_summary, buy_zone_stocks, sell_zone_stocks = analyze_weekly_deals(bulk_data) if not bulk_data.empty else (None, None, None)
 
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown("### 📊 Quick Stats (from sample tender data)")
-        st.metric("📌 Tenders Listed", f"{len(tenders)}")
-        st.metric("💰 Total Value", f"₹{tenders['Value_Cr'].sum():,} Cr")
-        l1_pct = round(100 * (tenders['Status'] == 'L1 Bidder').mean())
-        st.metric("🏢 L1 Bidders", f"{l1_pct}%")
+    # TABS
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📌 Tenders", "💹 Bulk Deals", "📊 Analysis", "🎯 Top Picks", "📈 Weekly Summary", "🧠 Buy/Sell Zone"])
 
     with tab1:
         st.warning("⚠️ **Sample data** — no free public API exists for government tender / L1-bidder data. This tab is illustrative, not live.")
@@ -207,7 +207,8 @@ def main():
         cutoff = datetime.now() - timedelta(days=days)
         filtered = tenders[pd.to_datetime(tenders['Date']) >= cutoff]
         filtered = filtered[filtered['Value_Cr'] >= min_val]
-        if filtered.empty: st.warning("No tenders found")
+        if filtered.empty:
+            st.warning("No tenders found")
         else:
             for _, row in filtered.iterrows():
                 c1, c2 = st.columns([3, 1])
@@ -220,24 +221,22 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
                 with c2:
-                    if st.button("🔍 Analyze", key=f"btn_{row.name}"):
+                    if st.button("🔍 Analyze", key=f"btn_tender_{row.name}"):
                         st.session_state.selected = row['Symbol']
                         st.session_state.tab = "analysis"
 
     with tab2:
         st.markdown("### 💹 Bulk & Block Deals — Live NSE Data")
-        if bulk_error:
-            st.error(f"⚠️ {bulk_error} Showing no data rather than fake numbers.")
-        elif bulk_deals.empty:
-            st.info("No bulk/block deals reported for the latest NSE session yet.")
+        if bulk_data.empty:
+            st.info("No bulk/block deals found for the selected period.")
         else:
-            st.caption(f"Source: NSE archives • fetched {datetime.now().strftime('%d %b %Y, %H:%M')} • cached 30 min")
-            deals = bulk_deals.head(10).copy()
-            deals["Qty"] = deals["Qty"].map(lambda x: f"{int(x):,}")
-            styled = deals.style.apply(lambda x: ['background: #d4edda' if x['Type'].startswith('Buy') else 'background: #f8d7da' for _ in x], axis=1)
+            st.caption(f"Source: NSE • fetched {datetime.now().strftime('%d %b %Y, %H:%M')} • cached 1 hour")
+            display = bulk_data.copy()
+            display['Qty'] = display['Qty'].map(lambda x: f"{int(x):,}")
+            display['Value_Cr'] = display['Value_Cr'].map(lambda x: f"₹{x:.2f} Cr")
+            styled = display.style.apply(lambda x: ['background: #d4edda' if x['Type'] == 'Buy' else 'background: #f8d7da' for _ in x], axis=1)
             st.dataframe(styled, use_container_width=True)
-            st.info("🟢 Buy = Institutional/Promoter confidence • 🔴 Sell = Caution")
-            st.caption("👉 For buyer/seller leaderboards, quantities, and full accumulation/distribution analysis, see the **🧠 Smart Money Tracker** tab.")
+            st.info("🟢 Buy = Institutional confidence • 🔴 Sell = Profit booking / Exit")
 
     with tab3:
         st.markdown("### 📊 AI Analysis Report")
@@ -246,26 +245,54 @@ def main():
             with st.spinner("🔄 Analyzing..."):
                 stock = get_stock(sym)
                 tender = tenders[tenders['Symbol'] == sym].iloc[0] if not tenders[tenders['Symbol'] == sym].empty else {'Value_Cr': 500, 'Ministry': 'N/A'}
-                bulk = bulk_deals[bulk_deals['Symbol'] == sym].iloc[0] if not bulk_deals[bulk_deals['Symbol'] == sym].empty else None
-                analysis = analyze(tender, stock, bulk)
+                bulk = bulk_data[bulk_data['Symbol'] == sym].iloc[0] if not bulk_data[bulk_data['Symbol'] == sym].empty else None
+                
+                # Analyze logic
+                score = 0; signals = []
+                if tender['Value_Cr'] > 1000: score += 20; signals.append("✅ Mega tender >₹1000 Cr")
+                elif tender['Value_Cr'] > 500: score += 15; signals.append("✅ Large tender >₹500 Cr")
+                elif tender['Value_Cr'] > 100: score += 10; signals.append("✅ Medium tender")
+                if stock['Change'] > 5: score += 20; signals.append("📈 Strong momentum")
+                elif stock['Change'] > 2: score += 10; signals.append("📈 Positive momentum")
+                if bulk is not None:
+                    if bulk['Type'] == 'Buy' and 'Promoter' in str(bulk['Buyer_Seller']): score += 20; signals.append("🔥 Promoter buying")
+                    elif bulk['Type'] == 'Buy': score += 10; signals.append("✅ Institutional buying")
+                    elif bulk['Type'] == 'Sell' and 'Promoter' in str(bulk['Buyer_Seller']): score -= 20; signals.append("🚨 Promoter selling")
+                rec = 'BUY ON DIPS' if score >= 30 else 'WATCHLIST' if score >= 15 else 'HOLD' if score >= 0 else 'STRICT AVOID'
+                risk = 'LOW' if score >= 30 else 'MEDIUM' if score >= 15 else 'HIGH'
+                
                 c1, c2, c3, c4 = st.columns(4)
                 with c1: st.metric("💰 CMP", f"₹{stock['CMP']:.2f}", f"{stock['Change']:+.2f}%")
                 with c2: st.metric("📊 Mkt Cap", f"₹{stock['MarketCap']/1e9:.2f}B")
-                with c3: st.metric("🎯 Score", f"{analysis['Score']}/100")
-                with c4: st.metric("⚠️ Risk", analysis['Risk'])
+                with c3: st.metric("🎯 Score", f"{score}/100")
+                with c4: st.metric("⚠️ Risk", risk)
                 st.markdown(f"""
-                ### 📋 Recommendation: <span style="color:{'green' if analysis['Score']>=30 else 'orange' if analysis['Score']>=15 else 'red'};">{analysis['Recommendation']}</span>
+                ### 📋 Recommendation: <span style="color:{'green' if score>=30 else 'orange' if score>=15 else 'red'};">{rec}</span>
                 #### Signals:
-                """ + "\n".join([f"- {s}" for s in analysis['Signals']]), unsafe_allow_html=True)
+                """ + "\n".join([f"- {s}" for s in signals]), unsafe_allow_html=True)
 
     with tab4:
         st.markdown("### 🎯 Top Picks")
         recs = []
         for _, row in tenders.iterrows():
             stock = get_stock(row['Symbol'])
-            bulk = bulk_deals[bulk_deals['Symbol'] == row['Symbol']]
-            a = analyze(row, stock, bulk.iloc[0] if not bulk.empty else None)
-            recs.append({'Company': row['Company'], 'Symbol': row['Symbol'], 'Value': row['Value_Cr'], 'CMP': stock['CMP'], 'Score': a['Score'], 'Rec': a['Recommendation'], 'Risk': a['Risk']})
+            bulk = bulk_data[bulk_data['Symbol'] == row['Symbol']]
+            bulk_row = bulk.iloc[0] if not bulk.empty else None
+            
+            # Simple scoring
+            score = 0
+            if row['Value_Cr'] > 1000: score += 20
+            elif row['Value_Cr'] > 500: score += 15
+            elif row['Value_Cr'] > 100: score += 10
+            if stock['Change'] > 5: score += 20
+            elif stock['Change'] > 2: score += 10
+            if bulk_row is not None and bulk_row['Type'] == 'Buy': score += 10
+            if bulk_row is not None and bulk_row['Type'] == 'Sell': score -= 10
+            
+            rec = 'BUY ON DIPS' if score >= 30 else 'WATCHLIST' if score >= 15 else 'HOLD' if score >= 0 else 'STRICT AVOID'
+            risk = 'LOW' if score >= 30 else 'MEDIUM' if score >= 15 else 'HIGH'
+            recs.append({'Company': row['Company'], 'Symbol': row['Symbol'], 'Value': row['Value_Cr'], 'CMP': stock['CMP'], 'Score': score, 'Rec': rec, 'Risk': risk})
+        
         df = pd.DataFrame(recs).sort_values('Score', ascending=False)
         def color(val):
             if 'BUY' in val: return 'background: #00c853; color: white; font-weight: bold;'
@@ -275,88 +302,75 @@ def main():
         st.dataframe(df.style.map(color, subset=["Rec"]), use_container_width=True)
 
     with tab5:
-        st.markdown("### 🧠 Smart Money Tracker — Who's Buying, Who's Selling")
-        st.caption(f"Source: NSE bulk & block deal archives • {datetime.now().strftime('%d %b %Y, %H:%M')} • cached 30 min")
-
-        if bulk_error:
-            st.error(f"⚠️ {bulk_error} No fake data shown.")
-        elif bulk_deals.empty:
-            st.info("No bulk/block deals reported for the latest NSE session yet.")
+        st.markdown("### 📈 Weekly Summary — Buy vs Sell Activity")
+        st.caption(f"Last {bulk_days} days • Source: NSE")
+        
+        if weekly_summary is None or weekly_summary.empty:
+            st.info("No data available for weekly summary.")
         else:
-            buy_total = bulk_deals.loc[bulk_deals["Type"].str.startswith("Buy"), "Value_Cr"].sum()
-            sell_total = bulk_deals.loc[bulk_deals["Type"].str.startswith("Sell"), "Value_Cr"].sum()
-            k1, k2, k3, k4 = st.columns(4)
-            with k1: st.metric("💰 Total Buy Value", f"₹{buy_total:,.0f} Cr")
-            with k2: st.metric("📤 Total Sell Value", f"₹{sell_total:,.0f} Cr")
-            with k3: st.metric("⚖️ Net Flow", f"₹{buy_total - sell_total:,.0f} Cr")
-            with k4: st.metric("📄 Total Deals", f"{len(bulk_deals)}")
-
+            # Key Metrics
+            total_buy = bulk_data[bulk_data['Type'] == 'Buy']['Value_Cr'].sum()
+            total_sell = bulk_data[bulk_data['Type'] == 'Sell']['Value_Cr'].sum()
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.metric("💰 Total Buy", f"₹{total_buy:.2f} Cr")
+            with c2: st.metric("📤 Total Sell", f"₹{total_sell:.2f} Cr")
+            with c3: st.metric("⚖️ Net Flow", f"₹{total_buy - total_sell:.2f} Cr")
+            with c4: st.metric("📄 Total Deals", f"{len(bulk_data)}")
+            
             st.markdown("---")
-            sub_buyers, sub_sellers, sub_accum, sub_dist, sub_all = st.tabs(
-                ["🟢 Top Buyers", "🔴 Top Sellers", "📈 Top Accumulation", "📉 Top Distribution", "📋 All Deals"]
-            )
+            st.markdown("#### 📊 Stock-wise Weekly Activity")
+            display = weekly_summary.copy()
+            display['Total_Qty'] = display['Total_Qty'].map(lambda x: f"{int(x):,}")
+            display['Total_Buy_Qty'] = display['Total_Buy_Qty'].map(lambda x: f"{int(x):,}")
+            display['Total_Sell_Qty'] = display['Total_Sell_Qty'].map(lambda x: f"{int(x):,}")
+            display['Net_Qty'] = display['Net_Qty'].map(lambda x: f"{int(x):,}")
+            display['Net_Value'] = display['Net_Value'].map(lambda x: f"₹{x:.2f} Cr")
+            st.dataframe(display[['Symbol', 'Company', 'Total_Buy_Qty', 'Total_Sell_Qty', 'Net_Qty', 'Buy_Value', 'Sell_Value', 'Net_Value', 'Zone']], use_container_width=True)
 
-            with sub_buyers:
-                st.markdown("#### Entities buying the most, by value")
-                buyers = build_leaderboard(bulk_deals, "Buy")
-                if buyers.empty:
-                    st.info("No buy-side deals found.")
-                else:
-                    display = buyers.head(15).copy()
-                    display["Total Quantity"] = display["Total Quantity"].map(lambda x: f"{int(x):,}")
-                    st.dataframe(display, use_container_width=True, hide_index=True)
-                    fig = go.Figure(go.Bar(
-                        x=buyers.head(10)["Entity"], y=buyers.head(10).iloc[:, 1],
-                        marker_color="#00c853"
-                    ))
-                    fig.update_layout(title="Top 10 Buyers by Value (₹ Cr)", height=350, margin=dict(t=40, b=10))
-                    st.plotly_chart(fig, use_container_width=True)
-
-            with sub_sellers:
-                st.markdown("#### Entities selling the most, by value")
-                sellers = build_leaderboard(bulk_deals, "Sell")
-                if sellers.empty:
-                    st.info("No sell-side deals found.")
-                else:
-                    display = sellers.head(15).copy()
-                    display["Total Quantity"] = display["Total Quantity"].map(lambda x: f"{int(x):,}")
-                    st.dataframe(display, use_container_width=True, hide_index=True)
-                    fig = go.Figure(go.Bar(
-                        x=sellers.head(10)["Entity"], y=sellers.head(10).iloc[:, 1],
-                        marker_color="#ff1744"
-                    ))
-                    fig.update_layout(title="Top 10 Sellers by Value (₹ Cr)", height=350, margin=dict(t=40, b=10))
-                    st.plotly_chart(fig, use_container_width=True)
-
-            with sub_accum:
-                st.markdown("#### Stocks with the strongest net buying (Buy value > Sell value)")
-                flow = build_stock_flow(bulk_deals)
-                accum = flow[flow["Net Value (₹ Cr)"] > 0].head(15)
-                if accum.empty:
-                    st.info("No stocks show net accumulation in the current data.")
-                else:
-                    st.dataframe(accum, use_container_width=True, hide_index=True)
-
-            with sub_dist:
-                st.markdown("#### Stocks with the strongest net selling (Sell value > Buy value)")
-                flow = build_stock_flow(bulk_deals)
-                dist = flow[flow["Net Value (₹ Cr)"] < 0].sort_values("Net Value (₹ Cr)").head(15)
-                if dist.empty:
-                    st.info("No stocks show net distribution in the current data.")
-                else:
-                    st.dataframe(dist, use_container_width=True, hide_index=True)
-
-            with sub_all:
-                st.markdown("#### Every individual deal (raw data)")
-                full = bulk_deals.copy()
-                full["Qty"] = full["Qty"].map(lambda x: f"{int(x):,}")
-                st.dataframe(full, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "⬇️ Download full deals as CSV",
-                    data=bulk_deals.to_csv(index=False).encode("utf-8"),
-                    file_name=f"nse_bulk_block_deals_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
-                )
+    with tab6:
+        st.markdown("### 🧠 Buy/Sell Zone — Individual Stock Analysis")
+        st.caption("🔍 Identify which stocks are in BUY ZONE, SELL ZONE, or NEUTRAL based on net institutional flow")
+        
+        if buy_zone_stocks is None or buy_zone_stocks.empty:
+            st.info("No stocks in BUY ZONE currently")
+        else:
+            st.markdown("#### 🟢 BUY ZONE STOCKS")
+            display_buy = buy_zone_stocks.copy()
+            display_buy['Total_Buy_Qty'] = display_buy['Total_Buy_Qty'].map(lambda x: f"{int(x):,}")
+            display_buy['Total_Sell_Qty'] = display_buy['Total_Sell_Qty'].map(lambda x: f"{int(x):,}")
+            display_buy['Net_Value'] = display_buy['Net_Value'].map(lambda x: f"₹{x:.2f} Cr")
+            st.dataframe(display_buy[['Symbol', 'Company', 'Total_Buy_Qty', 'Total_Sell_Qty', 'Net_Value', 'Zone']], use_container_width=True)
+        
+        if sell_zone_stocks is not None and not sell_zone_stocks.empty:
+            st.markdown("#### 🔴 SELL ZONE STOCKS")
+            display_sell = sell_zone_stocks.copy()
+            display_sell['Total_Buy_Qty'] = display_sell['Total_Buy_Qty'].map(lambda x: f"{int(x):,}")
+            display_sell['Total_Sell_Qty'] = display_sell['Total_Sell_Qty'].map(lambda x: f"{int(x):,}")
+            display_sell['Net_Value'] = display_sell['Net_Value'].map(lambda x: f"₹{x:.2f} Cr")
+            st.dataframe(display_sell[['Symbol', 'Company', 'Total_Buy_Qty', 'Total_Sell_Qty', 'Net_Value', 'Zone']], use_container_width=True)
+        
+        # Click-to-Analyze individual stocks
+        st.markdown("---")
+        st.markdown("#### 🔎 Click any stock below for detailed analysis")
+        
+        if weekly_summary is not None and not weekly_summary.empty:
+            # Create clickable buttons for each stock
+            cols = st.columns(4)
+            for idx, (_, row) in enumerate(weekly_summary.iterrows()):
+                with cols[idx % 4]:
+                    zone_color = "🟢" if "BUY" in row['Zone'] else "🔴" if "SELL" in row['Zone'] else "⚪"
+                    if st.button(f"{zone_color} {row['Symbol']}", key=f"zone_btn_{idx}"):
+                        st.session_state.selected = row['Symbol']
+                        st.session_state.tab = "analysis"
+                        st.rerun()
+            
+            # Also show full summary table with action
+            st.markdown("#### 📋 Complete Zone Summary")
+            full_display = weekly_summary.copy()
+            full_display['Total_Qty'] = full_display['Total_Qty'].map(lambda x: f"{int(x):,}")
+            full_display['Net_Qty'] = full_display['Net_Qty'].map(lambda x: f"{int(x):,}")
+            full_display['Net_Value'] = full_display['Net_Value'].map(lambda x: f"₹{x:.2f} Cr")
+            st.dataframe(full_display[['Symbol', 'Company', 'Total_Qty', 'Net_Qty', 'Net_Value', 'Zone']], use_container_width=True)
 
 if __name__ == "__main__":
     main()
