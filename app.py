@@ -4,11 +4,9 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import random
-import requests
-from io import StringIO
 from nsepython import nse_bulk_deal_data, nse_block_deal_data  # ✅ FIXED
 
-# ============= PAGE CONFIG =============
+# ============ PAGE CONFIG ============
 st.set_page_config(
     page_title="Tender Analyzer Pro",
     page_icon="📊",
