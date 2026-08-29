@@ -7,10 +7,7 @@ import random
 import requests
 from io import StringIO
 
-# ============= NSE DATA DIRECT FROM CSV (NO LIBRARY NEEDED) =============
-# NSE archives bulk/block deals as public CSV files
-# We fetch directly — no external library, works everywhere!
-
+# ============= NSE DATA DIRECT FROM CSV =============
 @st.cache_data(ttl=3600)
 def fetch_nse_bulk_deals(days=7):
     """Fetch bulk deals directly from NSE CSV archives"""
@@ -19,12 +16,11 @@ def fetch_nse_bulk_deals(days=7):
         
         for i in range(days):
             date = datetime.now() - timedelta(days=i)
-            if date.weekday() >= 5:  # Saturday=5, Sunday=6
+            if date.weekday() >= 5:
                 continue
             
             date_str = date.strftime("%d-%m-%Y")
             
-            # Try both bulk and block deals
             for deal_type, url in [
                 ("Bulk", f"https://archives.nseindia.com/content/equities/bulk_{date_str}.csv"),
                 ("Block", f"https://archives.nseindia.com/content/equities/block_{date_str}.csv")
@@ -50,7 +46,6 @@ def fetch_nse_bulk_deals(days=7):
         
         combined = pd.concat(all_deals, ignore_index=True)
         
-        # Normalize column names
         col_map = {}
         for col in combined.columns:
             col_upper = col.upper().strip()
@@ -69,18 +64,15 @@ def fetch_nse_bulk_deals(days=7):
         
         combined = combined.rename(columns=col_map)
         
-        # Ensure required columns exist
         required = ['Symbol', 'Company', 'Buyer_Seller', 'Type', 'Qty', 'Price']
         for col in required:
             if col not in combined.columns:
                 combined[col] = 'N/A'
         
-        # Convert to numeric
         combined['Qty'] = pd.to_numeric(combined['Qty'], errors='coerce').fillna(0)
         combined['Price'] = pd.to_numeric(combined['Price'], errors='coerce').fillna(0)
         combined['Value_Cr'] = (combined['Qty'] * combined['Price'] / 1e7).round(2)
         
-        # Clean Type
         combined['Type'] = combined['Type'].astype(str).str.upper().str.strip()
         combined['Type'] = combined['Type'].apply(
             lambda x: 'Buy' if 'BUY' in x else 'Sell' if 'SELL' in x else 'Unknown'
@@ -289,7 +281,8 @@ def main():
         recs = []
         for _, row in tenders.iterrows():
             stock = get_stock(row['Symbol'])
-            bulk = bulk_data[bulk_data['Symbol'] == row['Symbol']]
+            # ✅ FIX: Check if bulk_data is empty
+            bulk = bulk_data[bulk_data['Symbol'] == row['Symbol']] if not bulk_data.empty else pd.DataFrame()
             score = 0
             if row['Value_Cr'] > 1000: score += 20
             elif row['Value_Cr'] > 500: score += 15
