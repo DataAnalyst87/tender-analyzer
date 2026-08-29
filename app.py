@@ -160,7 +160,7 @@ def main():
             if 'AVOID' in val: return 'background: #ff1744; color: white; font-weight: bold;'
             if 'WATCHLIST' in val: return 'background: #ffab00; color: black;'
             return ''
-        st.dataframe(df.style.applymap(color, subset=['Rec']), use_container_width=True)
+        st.dataframe(df.style.map(color, subset=["Rec"]), use_container_width=True)
 
 if __name__ == "__main__":
     main()
