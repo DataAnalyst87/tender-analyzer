@@ -46,6 +46,7 @@ def fetch_nse_bulk_deals(days=7):
         
         combined = pd.concat(all_deals, ignore_index=True)
         
+        # Normalize column names
         col_map = {}
         for col in combined.columns:
             col_upper = col.upper().strip()
@@ -64,6 +65,7 @@ def fetch_nse_bulk_deals(days=7):
         
         combined = combined.rename(columns=col_map)
         
+        # Ensure required columns exist
         required = ['Symbol', 'Company', 'Buyer_Seller', 'Type', 'Qty', 'Price']
         for col in required:
             if col not in combined.columns:
@@ -175,8 +177,6 @@ def main():
     <style>
         .main-header { background: linear-gradient(135deg, #0a1628, #1a365d); padding: 2rem; border-radius: 15px; margin-bottom: 2rem; text-align: center; color: white; }
         .tender-card { background: #f8f9fa; padding: 1.2rem; border-radius: 12px; border-left: 5px solid #ff6b35; margin-bottom: 1rem; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-        .zone-buy { background: #d4edda; color: #155724; padding: 4px 12px; border-radius: 20px; font-weight: bold; }
-        .zone-sell { background: #f8d7da; color: #721c24; padding: 4px 12px; border-radius: 20px; font-weight: bold; }
         @media (max-width: 600px) { .stDataFrame { font-size: 11px; } .stButton button { width: 100%; } }
     </style>
     """, unsafe_allow_html=True)
@@ -251,8 +251,14 @@ def main():
         if st.button("🚀 Analyze Now", use_container_width=True):
             with st.spinner("🔄 Analyzing..."):
                 stock = get_stock(sym)
-                tender = tenders[tenders['Symbol'] == sym].iloc[0] if not tenders[tenders['Symbol'] == sym].empty else {'Value_Cr': 500}
-                bulk = bulk_data[bulk_data['Symbol'] == sym].iloc[0] if not bulk_data[bulk_data['Symbol'] == sym].empty else None
+                tender = tenders[tenders['Symbol'] == sym].iloc[0] if not tenders[tenders['Symbol'] == sym].empty else {'Value_Cr': 500, 'Ministry': 'N/A'}
+                
+                # ✅ FIXED: Check if bulk_data is empty AND has 'Symbol' column
+                if not bulk_data.empty and 'Symbol' in bulk_data.columns:
+                    matching = bulk_data[bulk_data['Symbol'] == sym]
+                    bulk = matching.iloc[0] if not matching.empty else None
+                else:
+                    bulk = None
                 
                 score = 0
                 signals = []
@@ -281,16 +287,21 @@ def main():
         recs = []
         for _, row in tenders.iterrows():
             stock = get_stock(row['Symbol'])
-            # ✅ FIX: Check if bulk_data is empty
-            bulk = bulk_data[bulk_data['Symbol'] == row['Symbol']] if not bulk_data.empty else pd.DataFrame()
+            # ✅ FIXED: Check if bulk_data is empty AND has 'Symbol' column
+            if not bulk_data.empty and 'Symbol' in bulk_data.columns:
+                matching = bulk_data[bulk_data['Symbol'] == row['Symbol']]
+                bulk = matching.iloc[0] if not matching.empty else None
+            else:
+                bulk = None
+            
             score = 0
             if row['Value_Cr'] > 1000: score += 20
             elif row['Value_Cr'] > 500: score += 15
             elif row['Value_Cr'] > 100: score += 10
             if stock['Change'] > 5: score += 20
             elif stock['Change'] > 2: score += 10
-            if not bulk.empty and bulk.iloc[0]['Type'] == 'Buy': score += 10
-            if not bulk.empty and bulk.iloc[0]['Type'] == 'Sell': score -= 10
+            if bulk is not None and bulk['Type'] == 'Buy': score += 10
+            if bulk is not None and bulk['Type'] == 'Sell': score -= 10
             rec = 'BUY ON DIPS' if score >= 30 else 'WATCHLIST' if score >= 15 else 'HOLD' if score >= 0 else 'STRICT AVOID'
             risk = 'LOW' if score >= 30 else 'MEDIUM' if score >= 15 else 'HIGH'
             recs.append({'Company': row['Company'], 'Symbol': row['Symbol'], 'Value': row['Value_Cr'], 'CMP': stock['CMP'], 'Score': score, 'Rec': rec, 'Risk': risk})
