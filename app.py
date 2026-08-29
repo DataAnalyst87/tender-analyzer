@@ -4,6 +4,8 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import random
+import requests
+from io import StringIO
 
 # ============= PAGE CONFIG =============
 st.set_page_config(
@@ -25,7 +27,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============= SAMPLE DATA (REALISTIC) =============
+# ============= SAMPLE DATA (CLEARLY LABELED — NOT LIVE) =============
+# No free public API exists for government tender / L1-bidder data (CPPP/GeM
+# don't expose one). This section stays illustrative sample data.
 def get_tenders():
     return pd.DataFrame({
         'Company': ['L&T', 'IRFC', 'HAL', 'RVNL', 'SJVN', 'KPI Green', 'Strides Pharma', 'Welspun Corp', 'BHEL', 'NTPC'],
@@ -36,15 +40,70 @@ def get_tenders():
         'Status': ['L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'Technical Clearance', 'L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'Technical Clearance']
     })
 
+# ============= REAL DATA: NSE BULK & BLOCK DEALS =============
+# NSE publishes today's bulk/block deals as free public CSV files.
+# These endpoints require a warmed-up session (cookies) + browser-like
+# headers, or NSE returns 403.
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/csv,application/csv,*/*",
+    "Referer": "https://www.nseindia.com/report-detail/display-bulk-and-block-deals",
+}
+
+@st.cache_data(ttl=1800)
 def get_bulk_deals():
-    return pd.DataFrame({
-        'Company': ['Welspun Corp', 'Strides Pharma', 'Apollo Tyres', 'L&T', 'HAL', 'RVNL'],
-        'Symbol': ['WELCORP', 'STRIDES', 'APOLLOTYRE', 'LT', 'HAL', 'RVNL'],
-        'Type': ['Sell', 'Buy', 'Block Deal', 'Buy', 'Sell', 'Buy'],
-        'Value_Cr': [1433, 99, 930, 500, 200, 85],
-        'Buyer_Seller': ['Promoter Group', 'Arun Pillai (Promoter)', 'Unknown HNI', 'Capital Group', 'PE Fund', 'FII'],
-        'Date': [(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(6)]
-    })
+    """Fetch real bulk + block deals for the latest available session from NSE.
+    Returns (dataframe, error_message). error_message is None on success."""
+    try:
+        session = requests.Session()
+        session.headers.update(NSE_HEADERS)
+        # Warm up session to get cookies NSE requires before serving data
+        session.get("https://www.nseindia.com", timeout=8)
+
+        frames = []
+        for kind, url in [
+            ("Bulk Deal", "https://archives.nseindia.com/content/equities/bulk.csv"),
+            ("Block Deal", "https://archives.nseindia.com/content/equities/block.csv"),
+        ]:
+            resp = session.get(url, timeout=8)
+            resp.raise_for_status()
+            df = pd.read_csv(StringIO(resp.text))
+            df.columns = [c.strip() for c in df.columns]
+            df["Deal_Kind"] = kind
+            frames.append(df)
+
+        combined = pd.concat(frames, ignore_index=True)
+
+        # Normalize NSE's raw column names into the app's schema
+        rename_map = {
+            "Date": "Date", "DATE": "Date",
+            "Symbol": "Symbol", "SYMBOL": "Symbol",
+            "Security Name": "Company", "SECURITY NAME": "Company",
+            "Client Name": "Buyer_Seller", "CLIENT NAME": "Buyer_Seller",
+            "Buy/Sell": "Type", "BUY / SELL": "Type",
+            "Quantity Traded": "Qty", "QUANTITY TRADED": "Qty",
+            "Trade Price / Wght. Avg. Price": "Price",
+            "TRADE PRICE / WGHT. AVG. PRICE": "Price",
+        }
+        combined = combined.rename(columns={k: v for k, v in rename_map.items() if k in combined.columns})
+
+        required = ["Date", "Symbol", "Company", "Buyer_Seller", "Type", "Qty", "Price"]
+        missing = [c for c in required if c not in combined.columns]
+        if missing:
+            return None, f"NSE changed their CSV format (missing columns: {missing})."
+
+        combined["Qty"] = pd.to_numeric(combined["Qty"], errors="coerce")
+        combined["Price"] = pd.to_numeric(combined["Price"], errors="coerce")
+        combined["Value_Cr"] = (combined["Qty"] * combined["Price"] / 1e7).round(2)
+        combined["Type"] = combined["Type"].astype(str).str.strip().str.title()
+        combined.loc[combined["Deal_Kind"] == "Block Deal", "Type"] = "Block Deal"
+
+        combined = combined[["Company", "Symbol", "Type", "Value_Cr", "Buyer_Seller", "Date"]]
+        combined = combined.sort_values("Value_Cr", ascending=False).reset_index(drop=True)
+        return combined, None
+    except Exception as e:
+        return None, f"Could not fetch live NSE data ({e})."
 
 # ============= STOCK DATA =============
 @st.cache_data(ttl=300)
@@ -85,20 +144,28 @@ def main():
         days = st.slider("📅 Tender Age", 1, 7, 3)
         min_val = st.slider("💰 Min Value (₹ Cr)", 50, 5000, 100)
         st.markdown("---")
-        st.markdown("### 📊 Quick Stats")
-        st.metric("📌 Tenders Today", "1,247", "+12%")
-        st.metric("💰 Total Value", "₹4,23,100 Cr", "+8%")
-        st.metric("🏢 L1 Bidders", "72%", "3%")
-        st.markdown("---")
         if st.button("🔄 Refresh All Data", use_container_width=True):
             st.cache_data.clear(); st.rerun()
 
     tab1, tab2, tab3, tab4 = st.tabs(["📌 Tenders", "💹 Bulk Deals", "📊 Analysis", "🎯 Top Picks"])
 
     tenders = get_tenders()
-    bulk_deals = get_bulk_deals()
+    bulk_deals, bulk_error = get_bulk_deals()
+    if bulk_error is not None:
+        # Fall back to empty frame with the right schema so the rest of the
+        # app (Analysis/Top Picks lookups) doesn't crash
+        bulk_deals = pd.DataFrame(columns=["Company", "Symbol", "Type", "Value_Cr", "Buyer_Seller", "Date"])
+
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("### 📊 Quick Stats (from sample tender data)")
+        st.metric("📌 Tenders Listed", f"{len(tenders)}")
+        st.metric("💰 Total Value", f"₹{tenders['Value_Cr'].sum():,} Cr")
+        l1_pct = round(100 * (tenders['Status'] == 'L1 Bidder').mean())
+        st.metric("🏢 L1 Bidders", f"{l1_pct}%")
 
     with tab1:
+        st.warning("⚠️ **Sample data** — no free public API exists for government tender / L1-bidder data. This tab is illustrative, not live.")
         st.markdown(f"### 📌 Latest Tenders (Last {days} Days)")
         cutoff = datetime.now() - timedelta(days=days)
         filtered = tenders[pd.to_datetime(tenders['Date']) >= cutoff]
@@ -121,11 +188,17 @@ def main():
                         st.session_state.tab = "analysis"
 
     with tab2:
-        st.markdown("### 💹 Bulk & Block Deals (Last 3 Days)")
-        deals = bulk_deals.head(10)
-        styled = deals.style.apply(lambda x: ['background: #d4edda' if x['Type'] == 'Buy' else 'background: #f8d7da' for _ in x], axis=1)
-        st.dataframe(styled, use_container_width=True)
-        st.info("🟢 Buy = Institutional/Promoter confidence • 🔴 Sell = Caution")
+        st.markdown("### 💹 Bulk & Block Deals — Live NSE Data")
+        if bulk_error:
+            st.error(f"⚠️ {bulk_error} Showing no data rather than fake numbers.")
+        elif bulk_deals.empty:
+            st.info("No bulk/block deals reported for the latest NSE session yet.")
+        else:
+            st.caption(f"Source: NSE archives • fetched {datetime.now().strftime('%d %b %Y, %H:%M')} • cached 30 min")
+            deals = bulk_deals.head(10)
+            styled = deals.style.apply(lambda x: ['background: #d4edda' if x['Type'] == 'Buy' else 'background: #f8d7da' for _ in x], axis=1)
+            st.dataframe(styled, use_container_width=True)
+            st.info("🟢 Buy = Institutional/Promoter confidence • 🔴 Sell = Caution")
 
     with tab3:
         st.markdown("### 📊 AI Analysis Report")
