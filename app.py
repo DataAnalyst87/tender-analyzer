@@ -97,7 +97,14 @@ def get_bulk_deals():
         combined["Price"] = pd.to_numeric(combined["Price"], errors="coerce")
         combined["Value_Cr"] = (combined["Qty"] * combined["Price"] / 1e7).round(2)
         combined["Type"] = combined["Type"].astype(str).str.strip().str.title()
-        combined.loc[combined["Deal_Kind"] == "Block Deal", "Type"] = "Block Deal"
+        # Keep the real Buy/Sell side, just tag which report it came from —
+        # forcing every block-deal row to the single label "Block Deal" was
+        # what caused the same trade to look like separate duplicate rows.
+        combined["Type"] = combined["Type"] + " (" + combined["Deal_Kind"].str.replace(" Deal", "", regex=False) + ")"
+
+        # The same trade can legitimately appear in both the bulk and block
+        # reports; collapse those into a single row per unique trade.
+        combined = combined.drop_duplicates(subset=["Symbol", "Date", "Value_Cr", "Buyer_Seller"], keep="first")
 
         combined = combined[["Company", "Symbol", "Type", "Value_Cr", "Buyer_Seller", "Date"]]
         combined = combined.sort_values("Value_Cr", ascending=False).reset_index(drop=True)
@@ -128,9 +135,9 @@ def analyze(tender, stock, bulk):
     if stock['Change'] > 5: score += 20; signals.append("📈 Strong momentum")
     elif stock['Change'] > 2: score += 10; signals.append("📈 Positive momentum")
     if bulk is not None:
-        if bulk['Type'] == 'Buy' and 'Promoter' in str(bulk['Buyer_Seller']): score += 20; signals.append("🔥 Promoter buying")
-        elif bulk['Type'] == 'Buy': score += 10; signals.append("✅ Institutional buying")
-        elif bulk['Type'] == 'Sell' and 'Promoter' in str(bulk['Buyer_Seller']): score -= 20; signals.append("🚨 Promoter selling")
+        if bulk['Type'].startswith('Buy') and 'Promoter' in str(bulk['Buyer_Seller']): score += 20; signals.append("🔥 Promoter buying")
+        elif bulk['Type'].startswith('Buy'): score += 10; signals.append("✅ Institutional buying")
+        elif bulk['Type'].startswith('Sell') and 'Promoter' in str(bulk['Buyer_Seller']): score -= 20; signals.append("🚨 Promoter selling")
     rec = 'BUY ON DIPS' if score >= 30 else 'WATCHLIST' if score >= 15 else 'HOLD' if score >= 0 else 'STRICT AVOID'
     risk = 'LOW' if score >= 30 else 'MEDIUM' if score >= 15 else 'HIGH'
     return {'Score': score, 'Signals': signals, 'Recommendation': rec, 'Risk': risk}
@@ -196,7 +203,7 @@ def main():
         else:
             st.caption(f"Source: NSE archives • fetched {datetime.now().strftime('%d %b %Y, %H:%M')} • cached 30 min")
             deals = bulk_deals.head(10)
-            styled = deals.style.apply(lambda x: ['background: #d4edda' if x['Type'] == 'Buy' else 'background: #f8d7da' for _ in x], axis=1)
+            styled = deals.style.apply(lambda x: ['background: #d4edda' if x['Type'].startswith('Buy') else 'background: #f8d7da' for _ in x], axis=1)
             st.dataframe(styled, use_container_width=True)
             st.info("🟢 Buy = Institutional/Promoter confidence • 🔴 Sell = Caution")
 
