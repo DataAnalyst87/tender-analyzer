@@ -25,18 +25,65 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============= SAMPLE DATA (CLEARLY LABELED — NOT LIVE) =============
-# No free public API exists for government tender / L1-bidder data (CPPP/GeM
-# don't expose one). This section stays illustrative sample data.
-def get_tenders():
-    return pd.DataFrame({
-        'Company': ['L&T', 'IRFC', 'HAL', 'RVNL', 'SJVN', 'KPI Green', 'Strides Pharma', 'Welspun Corp', 'BHEL', 'NTPC'],
-        'Symbol': ['LT', 'IRFC', 'HAL', 'RVNL', 'SJVN', 'KPIGREEN', 'STRIDES', 'WELCORP', 'BHEL', 'NTPC'],
-        'Value_Cr': [2400, 850, 1200, 221, 148, 450, 500, 1433, 780, 3200],
-        'Ministry': ['Defence', 'Railways', 'Air Force', 'Railways', 'Power', 'Renewable Energy', 'Pharma', 'Defence', 'Power', 'Power'],
-        'Date': [(datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(10)],
-        'Status': ['L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'Technical Clearance', 'L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'L1 Bidder', 'Technical Clearance']
+# ============= REAL DATA: ORDER/TENDER-WIN ANNOUNCEMENTS =============
+# There's no free API for government CPPP/GeM tender awards, but listed
+# companies are legally required to notify the stock exchange the moment
+# they win a material order/contract/tender. NSE publishes these as
+# "corporate announcements" — free, official, and genuinely real. We fetch
+# them and keyword-filter for order/tender/contract-win language.
+TENDER_KEYWORDS = [
+    "order", "tender", "contract", "l1 bidder", "letter of intent", " loi ",
+    "awarded", "bags order", "wins order", "work order", "purchase order",
+    "loa ", "letter of award",
+]
+
+def _find_col(df, candidates):
+    for c in df.columns:
+        lc = c.lower()
+        if any(cand in lc for cand in candidates):
+            return c
+    return None
+
+@st.cache_data(ttl=1800)
+def get_tender_win_announcements(days_back=7):
+    """Real NSE corporate announcements that look like order/tender wins.
+    Returns (dataframe, error_message). Empty dataframe + no error means
+    the search worked but genuinely found nothing — never fabricated."""
+    try:
+        from nse import NSE
+        import tempfile
+        to_d = datetime.now()
+        from_d = to_d - timedelta(days=days_back)
+        with NSE(download_folder=tempfile.gettempdir()) as nse_client:
+            records = nse_client.announcements(index="equities", from_date=from_d, to_date=to_d)
+    except Exception as e:
+        return None, f"Could not fetch NSE announcements ({e})."
+
+    if not records:
+        return pd.DataFrame(columns=["Date", "Symbol", "Company", "Announcement"]), None
+
+    df = pd.DataFrame(records)
+    symbol_col = _find_col(df, ["symbol"])
+    company_col = _find_col(df, ["sm_name", "company", "companyname"])
+    desc_col = _find_col(df, ["desc", "subject", "attchmnttext"])
+    date_col = _find_col(df, ["an_dt", "date", "dt"])
+
+    if desc_col is None:
+        return None, "NSE changed their announcements format (couldn't find a description field)."
+
+    text = df[desc_col].astype(str).str.lower()
+    mask = text.apply(lambda t: any(k in t for k in TENDER_KEYWORDS))
+    hits = df[mask].copy()
+    if hits.empty:
+        return pd.DataFrame(columns=["Date", "Symbol", "Company", "Announcement"]), None
+
+    out = pd.DataFrame({
+        "Date": hits[date_col] if date_col else "",
+        "Symbol": hits[symbol_col] if symbol_col else "",
+        "Company": hits[company_col] if company_col else (hits[symbol_col] if symbol_col else ""),
+        "Announcement": hits[desc_col],
     })
+    return out.reset_index(drop=True), None
 
 # ============= REAL DATA: NSE BULK & BLOCK DEALS =============
 # Uses the `nse` PyPI package (BennyThadikaran/NseIndiaApi), which wraps
@@ -175,11 +222,10 @@ def get_stock(symbol):
         return {'CMP': random.randint(100, 5000), 'Change': round(random.uniform(-5, 8), 2), 'MarketCap': random.randint(1000, 50000), 'PE': random.randint(10, 40)}
 
 # ============= AI ANALYSIS =============
-def analyze(tender, stock, bulk):
+def analyze(has_recent_tender, stock, bulk):
     score = 0; signals = []
-    if tender['Value_Cr'] > 1000: score += 20; signals.append("✅ Mega tender >₹1000 Cr")
-    elif tender['Value_Cr'] > 500: score += 15; signals.append("✅ Large tender >₹500 Cr")
-    elif tender['Value_Cr'] > 100: score += 10; signals.append("✅ Medium tender")
+    if has_recent_tender:
+        score += 15; signals.append("✅ Recent order/tender-win announcement (NSE, confirmed)")
     if stock['Change'] > 5: score += 20; signals.append("📈 Strong momentum")
     elif stock['Change'] > 2: score += 10; signals.append("📈 Positive momentum")
     if bulk is not None:
@@ -196,15 +242,17 @@ def main():
 
     with st.sidebar:
         st.markdown("### 🎯 Smart Filters")
-        days = st.slider("📅 Tender Age", 1, 7, 3)
-        min_val = st.slider("💰 Min Value (₹ Cr)", 50, 5000, 100)
+        days = st.slider("📅 Search Window (days)", 1, 30, 7, help="How far back to search NSE corporate announcements for order/tender-win language.")
         st.markdown("---")
         if st.button("🔄 Refresh All Data", use_container_width=True):
             st.cache_data.clear(); st.rerun()
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Tenders", "💹 Bulk Deals", "📊 Analysis", "🎯 Top Picks", "🧠 Smart Money Tracker"])
 
-    tenders = get_tenders()
+    tender_hits, tender_err = get_tender_win_announcements(days)
+    if tender_err is not None:
+        tender_hits = pd.DataFrame(columns=["Date", "Symbol", "Company", "Announcement"])
+
     bulk_deals, bulk_error, bulk_as_of = get_bulk_deals()
     if bulk_error is not None:
         # Fall back to empty frame with the right schema so the rest of the
@@ -213,34 +261,29 @@ def main():
 
     with st.sidebar:
         st.markdown("---")
-        st.markdown("### 📊 Quick Stats (from sample tender data)")
-        st.metric("📌 Tenders Listed", f"{len(tenders)}")
-        st.metric("💰 Total Value", f"₹{tenders['Value_Cr'].sum():,} Cr")
-        l1_pct = round(100 * (tenders['Status'] == 'L1 Bidder').mean())
-        st.metric("🏢 L1 Bidders", f"{l1_pct}%")
+        st.markdown("### 📊 Quick Stats (real, from NSE)")
+        st.metric("📌 Tender/Order-Win Announcements", f"{len(tender_hits)}", help=f"Last {days} days, listed companies only")
+        st.metric("🏢 Companies Involved", f"{tender_hits['Symbol'].nunique() if not tender_hits.empty else 0}")
 
     with tab1:
-        st.warning("⚠️ **Sample data** — no free public API exists for government tender / L1-bidder data. This tab is illustrative, not live.")
-        st.markdown(f"### 📌 Latest Tenders (Last {days} Days)")
-        cutoff = datetime.now() - timedelta(days=days)
-        filtered = tenders[pd.to_datetime(tenders['Date']) >= cutoff]
-        filtered = filtered[filtered['Value_Cr'] >= min_val]
-        if filtered.empty: st.warning("No tenders found")
+        st.caption(
+            f"Source: NSE corporate announcements, keyword-matched for order/tender/contract-win language • last {days} days • cached 30 min. "
+            "Covers **listed companies only** — CPPP/GeM government tender data has no free public API, so smaller/unlisted awardees won't show here."
+        )
+        st.markdown(f"### 📌 Confirmed Order/Tender-Win Announcements (Last {days} Days)")
+        if tender_err:
+            st.error(f"⚠️ {tender_err}")
+        elif tender_hits.empty:
+            st.info(f"No confirmed order/tender-win announcements found for listed companies in the last {days} days. Try widening the search window in the sidebar.")
         else:
-            for _, row in filtered.iterrows():
-                c1, c2 = st.columns([3, 1])
-                with c1:
-                    st.markdown(f"""
-                    <div class="tender-card">
-                        <h4>🏢 {row['Company']}</h4>
-                        <p><strong>₹{row['Value_Cr']:,} Cr</strong> • {row['Ministry']} • {row['Status']}</p>
-                        <p style="font-size:0.85rem;color:#666;">📅 {row['Date']} • Symbol: {row['Symbol']}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                with c2:
-                    if st.button("🔍 Analyze", key=f"btn_{row.name}"):
-                        st.session_state.selected = row['Symbol']
-                        st.session_state.tab = "analysis"
+            for _, row in tender_hits.iterrows():
+                st.markdown(f"""
+                <div class="tender-card">
+                    <h4>🏢 {row['Company']} <span style="font-size:0.8rem;color:#666;">({row['Symbol']})</span></h4>
+                    <p>{row['Announcement']}</p>
+                    <p style="font-size:0.85rem;color:#666;">📅 {row['Date']}</p>
+                </div>
+                """, unsafe_allow_html=True)
 
     with tab2:
         st.markdown("### 💹 Bulk & Block Deals — Live NSE Data")
@@ -263,34 +306,41 @@ def main():
         if st.button("🚀 Analyze Now", use_container_width=True):
             with st.spinner("🔄 Analyzing..."):
                 stock = get_stock(sym)
-                tender = tenders[tenders['Symbol'] == sym].iloc[0] if not tenders[tenders['Symbol'] == sym].empty else {'Value_Cr': 500, 'Ministry': 'N/A'}
+                has_recent_tender = (not tender_hits.empty) and (sym.upper() in tender_hits['Symbol'].str.upper().values)
                 bulk = bulk_deals[bulk_deals['Symbol'] == sym].iloc[0] if not bulk_deals[bulk_deals['Symbol'] == sym].empty else None
-                analysis = analyze(tender, stock, bulk)
+                analysis = analyze(has_recent_tender, stock, bulk)
                 c1, c2, c3, c4 = st.columns(4)
                 with c1: st.metric("💰 CMP", f"₹{stock['CMP']:.2f}", f"{stock['Change']:+.2f}%")
                 with c2: st.metric("📊 Mkt Cap", f"₹{stock['MarketCap']/1e9:.2f}B")
                 with c3: st.metric("🎯 Score", f"{analysis['Score']}/100")
                 with c4: st.metric("⚠️ Risk", analysis['Risk'])
+                signals_text = "\n".join([f"- {s}" for s in analysis['Signals']]) if analysis['Signals'] else "_No additional signals found._"
                 st.markdown(f"""
                 ### 📋 Recommendation: <span style="color:{'green' if analysis['Score']>=30 else 'orange' if analysis['Score']>=15 else 'red'};">{analysis['Recommendation']}</span>
                 #### Signals:
-                """ + "\n".join([f"- {s}" for s in analysis['Signals']]), unsafe_allow_html=True)
+                {signals_text}
+                """, unsafe_allow_html=True)
 
     with tab4:
         st.markdown("### 🎯 Top Picks")
-        recs = []
-        for _, row in tenders.iterrows():
-            stock = get_stock(row['Symbol'])
-            bulk = bulk_deals[bulk_deals['Symbol'] == row['Symbol']]
-            a = analyze(row, stock, bulk.iloc[0] if not bulk.empty else None)
-            recs.append({'Company': row['Company'], 'Symbol': row['Symbol'], 'Value': row['Value_Cr'], 'CMP': stock['CMP'], 'Score': a['Score'], 'Rec': a['Recommendation'], 'Risk': a['Risk']})
-        df = pd.DataFrame(recs).sort_values('Score', ascending=False)
-        def color(val):
-            if 'BUY' in val: return 'background: #00c853; color: white; font-weight: bold;'
-            if 'AVOID' in val: return 'background: #ff1744; color: white; font-weight: bold;'
-            if 'WATCHLIST' in val: return 'background: #ffab00; color: black;'
-            return ''
-        st.dataframe(df.style.map(color, subset=["Rec"]), use_container_width=True)
+        st.caption("Ranked only among companies with a **confirmed** NSE order/tender-win announcement in the search window — no sample/fake entries.")
+        if tender_hits.empty:
+            st.info(f"No confirmed order/tender-win announcements in the last {days} days, so there's nothing real to rank yet. Try widening the search window in the sidebar.")
+        else:
+            recs = []
+            for symbol in tender_hits['Symbol'].unique():
+                stock = get_stock(symbol)
+                bulk = bulk_deals[bulk_deals['Symbol'] == symbol]
+                a = analyze(True, stock, bulk.iloc[0] if not bulk.empty else None)
+                company = tender_hits[tender_hits['Symbol'] == symbol]['Company'].iloc[0]
+                recs.append({'Company': company, 'Symbol': symbol, 'CMP': stock['CMP'], 'Score': a['Score'], 'Rec': a['Recommendation'], 'Risk': a['Risk']})
+            df = pd.DataFrame(recs).sort_values('Score', ascending=False)
+            def color(val):
+                if 'BUY' in val: return 'background: #00c853; color: white; font-weight: bold;'
+                if 'AVOID' in val: return 'background: #ff1744; color: white; font-weight: bold;'
+                if 'WATCHLIST' in val: return 'background: #ffab00; color: black;'
+                return ''
+            st.dataframe(df.style.map(color, subset=["Rec"]), use_container_width=True)
 
     with tab5:
         st.markdown("### 🧠 Smart Money Tracker — Who's Buying, Who's Selling")
