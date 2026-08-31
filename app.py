@@ -91,19 +91,27 @@ def fetch_nse_deals_range(from_date_str, to_date_str):
 
 @st.cache_data(ttl=1800)
 def get_bulk_deals():
-    """Today's deals only, in the schema the rest of the app already expects.
-    Returns (dataframe, error_message)."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    df, err = fetch_nse_deals_range(today, today)
-    if err:
-        return None, err
-    if df.empty:
-        return pd.DataFrame(columns=["Company", "Symbol", "Type", "Value_Cr", "Qty", "Buyer_Seller", "Date"]), None
-    out = df.copy()
-    out["Type"] = out["Type"] + " (" + out["Deal_Kind"] + ")"
-    out["Date"] = out["Date"].dt.strftime("%d-%b-%Y")
-    out = out[["Company", "Symbol", "Type", "Value_Cr", "Qty", "Buyer_Seller", "Date"]]
-    return out.sort_values("Value_Cr", ascending=False).reset_index(drop=True), None
+    """Latest available trading day's deals, in the schema the rest of the
+    app already expects. NSE only publishes a day's bulk/block report after
+    market hours, so if today's isn't out yet we fall back to the most
+    recent day that has one — never fabricating data for a gap.
+    Returns (dataframe, error_message, as_of_date_str)."""
+    last_err = None
+    for back in range(0, 6):  # try today, then up to 5 days back
+        day = (datetime.now() - timedelta(days=back)).strftime("%Y-%m-%d")
+        df, err = fetch_nse_deals_range(day, day)
+        if err:
+            last_err = err
+            continue
+        if not df.empty:
+            out = df.copy()
+            out["Type"] = out["Type"] + " (" + out["Deal_Kind"] + ")"
+            out["Date"] = out["Date"].dt.strftime("%d-%b-%Y")
+            out = out[["Company", "Symbol", "Type", "Value_Cr", "Qty", "Buyer_Seller", "Date"]]
+            return out.sort_values("Value_Cr", ascending=False).reset_index(drop=True), None, day
+    if last_err:
+        return None, last_err, None
+    return pd.DataFrame(columns=["Company", "Symbol", "Type", "Value_Cr", "Qty", "Buyer_Seller", "Date"]), None, None
 
 # ============= SMART MONEY AGGREGATIONS =============
 def build_leaderboard(df, side):
@@ -197,7 +205,7 @@ def main():
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Tenders", "💹 Bulk Deals", "📊 Analysis", "🎯 Top Picks", "🧠 Smart Money Tracker"])
 
     tenders = get_tenders()
-    bulk_deals, bulk_error = get_bulk_deals()
+    bulk_deals, bulk_error, bulk_as_of = get_bulk_deals()
     if bulk_error is not None:
         # Fall back to empty frame with the right schema so the rest of the
         # app (Analysis/Top Picks lookups) doesn't crash
@@ -241,7 +249,7 @@ def main():
         elif bulk_deals.empty:
             st.info("No bulk/block deals reported for the latest NSE session yet.")
         else:
-            st.caption(f"Source: NSE archives • fetched {datetime.now().strftime('%d %b %Y, %H:%M')} • cached 30 min")
+            st.caption(f"Source: NSE • data for **{bulk_as_of}** (latest available session) • cached 30 min")
             deals = bulk_deals.head(10).copy()
             deals["Qty"] = deals["Qty"].map(lambda x: f"{int(x):,}")
             styled = deals.style.apply(lambda x: ['background: #d4edda' if x['Type'].startswith('Buy') else 'background: #f8d7da' for _ in x], axis=1)
@@ -286,7 +294,8 @@ def main():
 
     with tab5:
         st.markdown("### 🧠 Smart Money Tracker — Who's Buying, Who's Selling")
-        st.caption(f"Source: NSE bulk & block deal archives • {datetime.now().strftime('%d %b %Y, %H:%M')} • cached 30 min")
+        if bulk_as_of:
+            st.caption(f"Source: NSE • data for **{bulk_as_of}** (latest available session) • cached 30 min")
 
         if bulk_error:
             st.error(f"⚠️ {bulk_error} No fake data shown.")
