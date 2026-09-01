@@ -15,11 +15,85 @@ st.set_page_config(
 # ============= STYLING =============
 st.markdown("""
 <style>
-    .main-header { background: linear-gradient(135deg, #0a1628, #1a365d); padding: 2rem; border-radius: 15px; margin-bottom: 2rem; text-align: center; color: white; }
-    .tender-card { background: #f8f9fa; padding: 1.2rem; border-radius: 12px; border-left: 5px solid #ff6b35; margin-bottom: 1rem; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
-    .buy-tag { color: #00c853; font-weight: bold; }
-    .sell-tag { color: #ff1744; font-weight: bold; }
-    .metric-box { background: white; padding: 1.2rem; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); text-align: center; border-top: 4px solid #1a365d; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+    @keyframes fadeInUp {
+        from { opacity: 0; transform: translateY(12px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes shimmer {
+        0% { background-position: -400px 0; }
+        100% { background-position: 400px 0; }
+    }
+    @keyframes pulseGlow {
+        0%, 100% { box-shadow: 0 0 0 rgba(26,54,93,0.0); }
+        50% { box-shadow: 0 0 18px rgba(26,54,93,0.25); }
+    }
+
+    .main-header {
+        background: linear-gradient(135deg, #0a1628 0%, #1a365d 55%, #2b4f81 100%);
+        padding: 2.2rem; border-radius: 18px; margin-bottom: 1.6rem; text-align: center;
+        color: white; animation: fadeInUp 0.6s ease-out, pulseGlow 6s ease-in-out infinite;
+        box-shadow: 0 8px 24px rgba(10,22,40,0.35);
+    }
+    .main-header h1 { letter-spacing: 0.5px; font-weight: 800; }
+
+    .tender-card {
+        background: #ffffff; padding: 1.3rem; border-radius: 14px;
+        border-left: 5px solid #ff6b35; margin-bottom: 1rem;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+        animation: fadeInUp 0.45s ease-out;
+    }
+    .tender-card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0,0,0,0.12); }
+
+    .buy-tag { color: #00c853; font-weight: 700; }
+    .sell-tag { color: #ff1744; font-weight: 700; }
+
+    .metric-box {
+        background: white; padding: 1.2rem; border-radius: 14px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.06); text-align: center;
+        border-top: 4px solid #1a365d; transition: transform 0.2s ease;
+        animation: fadeInUp 0.5s ease-out;
+    }
+    .metric-box:hover { transform: translateY(-2px); }
+
+    /* Streamlit's own metric widgets get a subtle card treatment + entrance */
+    div[data-testid="stMetric"] {
+        background: linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%);
+        border: 1px solid #e7ecf3; border-radius: 14px; padding: 0.9rem 1rem;
+        box-shadow: 0 2px 8px rgba(20,30,60,0.05);
+        animation: fadeInUp 0.5s ease-out; transition: box-shadow 0.2s ease, transform 0.2s ease;
+    }
+    div[data-testid="stMetric"]:hover { box-shadow: 0 6px 16px rgba(20,30,60,0.10); transform: translateY(-2px); }
+
+    /* Tabs: smoother active-state transition */
+    button[data-baseweb="tab"] { transition: color 0.2s ease, border-color 0.2s ease; }
+
+    /* DataFrames fade in */
+    div[data-testid="stDataFrame"] { animation: fadeInUp 0.4s ease-out; border-radius: 10px; overflow: hidden; }
+
+    /* Buttons: gradient + lift */
+    .stButton button, .stDownloadButton button {
+        background: linear-gradient(135deg, #1a365d, #2b4f81);
+        color: white; border: none; border-radius: 10px; font-weight: 600;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .stButton button:hover, .stDownloadButton button:hover {
+        transform: translateY(-2px); box-shadow: 0 6px 16px rgba(26,54,93,0.35);
+    }
+
+    /* Score badge pills — used via st.markdown for consistent green/amber/red look */
+    .score-pill {
+        display: inline-block; padding: 0.25rem 0.75rem; border-radius: 999px;
+        font-weight: 700; font-size: 0.85rem; animation: fadeInUp 0.4s ease-out;
+    }
+    .score-high { background: #d4edda; color: #0a5c2e; }
+    .score-mid  { background: #fff3cd; color: #7a5c00; }
+    .score-low  { background: #f8d7da; color: #7a1224; }
+
     @media (max-width: 600px) { .stDataFrame { font-size: 11px; } .stButton button { width: 100%; } }
 </style>
 """, unsafe_allow_html=True)
@@ -229,6 +303,11 @@ def get_stock(symbol):
         return None, f"Could not fetch stock data for {symbol} ({e})."
 
 # ============= AI ANALYSIS =============
+def score_pill_html(score, max_score=100):
+    pct = (score / max_score) * 100 if max_score else 0
+    cls = "score-high" if pct >= 70 else ("score-mid" if pct >= 50 else "score-low")
+    return f'<span class="score-pill {cls}">{score}/{max_score}</span>'
+
 def analyze(has_recent_tender, stock, bulk):
     score = 0; signals = []
     if has_recent_tender:
@@ -424,8 +503,9 @@ def main():
                     with c3: st.metric("🎯 Score", f"{analysis['Score']}/100")
                     with c4: st.metric("⚠️ Risk", analysis['Risk'])
                     signals_text = "\n".join([f"- {s}" for s in analysis['Signals']]) if analysis['Signals'] else "_No additional signals found._"
+                    rec_color = '#0a5c2e' if analysis['Score']>=30 else ('#7a5c00' if analysis['Score']>=15 else '#7a1224')
                     st.markdown(f"""
-                    ### 📋 Recommendation: <span style="color:{'green' if analysis['Score']>=30 else 'orange' if analysis['Score']>=15 else 'red'};">{analysis['Recommendation']}</span>
+                    ### 📋 Recommendation: <span style="color:{rec_color};">{analysis['Recommendation']}</span> {score_pill_html(analysis['Score'])}
                     #### Signals:
                     {signals_text}
                     """, unsafe_allow_html=True)
@@ -638,6 +718,7 @@ def main():
             f"last {days} days) are considered. Each is checked against real yfinance stock ratios and NSE's own "
             "quarterly financial filings before ranking — nothing here is estimated or invented."
         )
+        MIN_SCORE = 50
         if tender_hits.empty:
             st.info(f"No confirmed order/tender-win announcements in the last {days} days — nothing to vet yet. Widen the search window in the sidebar.")
         else:
@@ -663,23 +744,40 @@ def main():
                         "notes": notes, "fin_trend": fin_trend, "fin_err": fin_err,
                     })
 
+            qualified = [e for e in evaluated if e["Fundamental Score"] >= MIN_SCORE]
+
             if not evaluated:
                 st.info("Found tender-win announcements, but couldn't fetch real fundamentals for any of those symbols.")
+            elif not qualified:
+                st.warning(
+                    f"⚠️ None of the {len(evaluated)} evaluated companies scored {MIN_SCORE}+ right now. "
+                    f"Highest was {max(e['Fundamental Score'] for e in evaluated)}/100 — showing nothing rather than a weak pick."
+                )
             else:
-                evaluated.sort(key=lambda x: x["Fundamental Score"], reverse=True)
-                top_picks = evaluated[:top_n]
+                st.success(f"✅ {len(qualified)} of {len(evaluated)} companies scored {MIN_SCORE}+ ")
+                qualified.sort(key=lambda x: x["Fundamental Score"], reverse=True)
+                top_picks = qualified[:top_n]
 
                 summary_df = pd.DataFrame([{
                     "Rank": i + 1, "Company": e["Company"], "Symbol": e["Symbol"],
                     "Tender Date": e["Tender Date"], "CMP": f"₹{e['CMP']:.2f}",
                     "Change %": f"{e['Change %']:+.2f}%", "Fundamental Score": f"{e['Fundamental Score']}/100",
                 } for i, e in enumerate(top_picks)])
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    summary_df.style.map(
+                        lambda v: 'background: #d4edda; color: #0a5c2e; font-weight: 600;' if isinstance(v, str) and '/100' in v and int(v.split('/')[0]) >= 70
+                        else ('background: #fff3cd; color: #7a5c00; font-weight: 600;' if isinstance(v, str) and '/100' in v else ''),
+                        subset=["Fundamental Score"]
+                    ),
+                    use_container_width=True, hide_index=True
+                )
 
                 st.markdown("---")
                 st.markdown("#### Detailed breakdown")
                 for i, e in enumerate(top_picks):
-                    with st.expander(f"#{i+1} — {e['Company']} ({e['Symbol']}) — Score {e['Fundamental Score']}/100"):
+                    score_emoji = "🟢" if e["Fundamental Score"] >= 70 else "🟡"
+                    with st.expander(f"{score_emoji} #{i+1} — {e['Company']} ({e['Symbol']}) — Score {e['Fundamental Score']}/100"):
+                        st.markdown(score_pill_html(e["Fundamental Score"]), unsafe_allow_html=True)
                         st.markdown("**Why it ranks here:**")
                         if e["notes"]:
                             for n in e["notes"]:
