@@ -3,7 +3,6 @@ import pandas as pd
 import yfinance as yf
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
-import random
 
 # ============= PAGE CONFIG =============
 st.set_page_config(
@@ -210,16 +209,24 @@ def build_stock_zone_table(df):
 # ============= STOCK DATA =============
 @st.cache_data(ttl=300)
 def get_stock(symbol):
+    """Real yfinance data only. Returns (data_dict_or_None, error_message)."""
     try:
         ticker = yf.Ticker(symbol + ".NS")
         info = ticker.info
         hist = ticker.history(period="5d")
+        if hist.empty and not info.get('currentPrice'):
+            return None, f"No live price data found for {symbol}."
         cmp = hist['Close'].iloc[-1] if not hist.empty else info.get('currentPrice', 0)
         prev = hist['Close'].iloc[-2] if len(hist) > 1 else cmp
         change = round(((cmp - prev) / prev) * 100, 2) if prev > 0 else 0
-        return {'CMP': round(cmp, 2), 'Change': change, 'MarketCap': info.get('marketCap', 0), 'PE': info.get('trailingPE', 0)}
-    except:
-        return {'CMP': random.randint(100, 5000), 'Change': round(random.uniform(-5, 8), 2), 'MarketCap': random.randint(1000, 50000), 'PE': random.randint(10, 40)}
+        return {
+            'CMP': round(cmp, 2), 'Change': change,
+            'MarketCap': info.get('marketCap', 0), 'PE': info.get('trailingPE', 0),
+            'ROE': info.get('returnOnEquity'), 'DebtToEquity': info.get('debtToEquity'),
+            'ProfitMargin': info.get('profitMargins'), 'Sector': info.get('sector', 'N/A'),
+        }, None
+    except Exception as e:
+        return None, f"Could not fetch stock data for {symbol} ({e})."
 
 # ============= AI ANALYSIS =============
 def analyze(has_recent_tender, stock, bulk):
@@ -236,6 +243,105 @@ def analyze(has_recent_tender, stock, bulk):
     risk = 'LOW' if score >= 30 else 'MEDIUM' if score >= 15 else 'HIGH'
     return {'Score': score, 'Signals': signals, 'Recommendation': rec, 'Risk': risk}
 
+@st.cache_data(ttl=1800)
+def get_financial_trend(symbol):
+    """Real quarterly revenue/net-profit trend from NSE's own filings.
+    Returns (list of {period, revenue_cr, net_profit_cr}, error_message)."""
+    try:
+        from nse import NSE
+        import tempfile
+        with NSE(download_folder=tempfile.gettempdir()) as nse_client:
+            data = nse_client.results_comparison(symbol)
+        rows = data.get("resCmpData", []) if isinstance(data, dict) else []
+        if not rows:
+            return [], "No financial results data found."
+        out = []
+        for row in rows:
+            try:
+                out.append({
+                    "period": row.get("re_to_dt", "N/A"),
+                    "revenue_cr": round(float(row.get("re_total_inc", 0)) / 100, 1),
+                    "net_profit_cr": round(float(row.get("re_net_profit", 0)) / 100, 1),
+                })
+            except (TypeError, ValueError):
+                continue
+        return out, None
+    except Exception as e:
+        return [], f"Could not fetch financial results ({e})."
+
+@st.cache_data(ttl=1800)
+def get_shareholding_snapshot(symbol):
+    """Real, latest-quarter shareholding pattern as filed with NSE (Promoter/
+    Public breakdown at minimum; other categories included as NSE reports
+    them — field names aren't force-mapped to avoid mislabeling)."""
+    try:
+        from nse import NSE
+        import tempfile
+        with NSE(download_folder=tempfile.gettempdir()) as nse_client:
+            data = nse_client.shareholding(symbol)
+        records = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
+        if not records:
+            return None, "No shareholding pattern data found."
+        latest = records[0]
+        return latest, None
+    except Exception as e:
+        return None, f"Could not fetch shareholding pattern ({e})."
+
+@st.cache_data(ttl=1800)
+def get_post_tender_buying(symbol, tender_date_str):
+    """Real bulk/block deal buying for this symbol from the tender-win date
+    through today, using the same NSE deals pipeline as the rest of the app."""
+    try:
+        tender_date = pd.to_datetime(tender_date_str, format="%d-%b-%Y", errors="coerce")
+        if pd.isna(tender_date):
+            tender_date = pd.to_datetime(tender_date_str, errors="coerce")
+        if pd.isna(tender_date):
+            return pd.DataFrame(), "Could not parse tender announcement date."
+        from_d = tender_date.date()
+        to_d = datetime.now().date()
+        if from_d > to_d:
+            return pd.DataFrame(), None
+        df, err = fetch_nse_deals_range(str(from_d), str(to_d))
+        if err:
+            return pd.DataFrame(), err
+        if df.empty:
+            return df, None
+        return df[df["Symbol"].str.upper() == symbol.upper()].copy(), None
+    except Exception as e:
+        return pd.DataFrame(), f"Could not check post-tender deals ({e})."
+
+def compute_fundamental_score(stock, fin_trend):
+    """Score 0-100 from real, verifiable signals only. Returns (score, notes)."""
+    score = 0
+    notes = []
+    if stock.get("Change") is not None:
+        if stock["Change"] > 3: score += 15; notes.append("Positive price momentum")
+        elif stock["Change"] < -3: notes.append("Negative price momentum")
+    roe = stock.get("ROE")
+    if roe is not None:
+        if roe > 0.15: score += 20; notes.append(f"Healthy ROE ({roe*100:.1f}%)")
+        elif roe > 0: score += 10; notes.append(f"Positive ROE ({roe*100:.1f}%)")
+        else: notes.append(f"Negative ROE ({roe*100:.1f}%)")
+    d2e = stock.get("DebtToEquity")
+    if d2e is not None:
+        if d2e < 50: score += 15; notes.append(f"Low debt (D/E {d2e:.0f})")
+        elif d2e < 150: score += 5; notes.append(f"Moderate debt (D/E {d2e:.0f})")
+        else: notes.append(f"High debt (D/E {d2e:.0f})")
+    pm = stock.get("ProfitMargin")
+    if pm is not None:
+        if pm > 0.1: score += 15; notes.append(f"Solid profit margin ({pm*100:.1f}%)")
+        elif pm > 0: score += 5; notes.append(f"Thin profit margin ({pm*100:.1f}%)")
+        else: notes.append(f"Negative profit margin ({pm*100:.1f}%)")
+    if len(fin_trend) >= 2:
+        latest, prev = fin_trend[0], fin_trend[1]
+        if latest["net_profit_cr"] > prev["net_profit_cr"] > 0:
+            score += 20; notes.append("Net profit grew quarter-on-quarter")
+        elif latest["net_profit_cr"] > 0:
+            score += 10; notes.append("Profitable, but profit didn't grow QoQ")
+        else:
+            notes.append("Latest quarter net profit is negative")
+    return min(score, 100), notes
+
 # ============= MAIN UI =============
 def main():
     st.markdown('<div class="main-header"><h1>📊 Tender Analyzer Pro</h1><p>Live Tender Scanner • Bulk Deal Tracker • AI Analysis</p><p style="font-size:0.9rem;opacity:0.8;">📅 {} • Powered by AI</p></div>'.format(datetime.now().strftime('%d %B %Y')), unsafe_allow_html=True)
@@ -247,7 +353,7 @@ def main():
         if st.button("🔄 Refresh All Data", use_container_width=True):
             st.cache_data.clear(); st.rerun()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📌 Tenders", "💹 Bulk Deals", "📊 Analysis", "🎯 Top Picks", "🧠 Smart Money Tracker"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📌 Tenders", "💹 Bulk Deals", "📊 Analysis", "🎯 Top Picks", "🧠 Smart Money Tracker", "🏆 Top Tender Picks"])
 
     tender_hits, tender_err = get_tender_win_announcements(days)
     if tender_err is not None:
@@ -305,21 +411,24 @@ def main():
         sym = st.text_input("🔍 Enter Symbol (e.g., LT, IRFC, HAL)", "LT")
         if st.button("🚀 Analyze Now", use_container_width=True):
             with st.spinner("🔄 Analyzing..."):
-                stock = get_stock(sym)
-                has_recent_tender = (not tender_hits.empty) and (sym.upper() in tender_hits['Symbol'].str.upper().values)
-                bulk = bulk_deals[bulk_deals['Symbol'] == sym].iloc[0] if not bulk_deals[bulk_deals['Symbol'] == sym].empty else None
-                analysis = analyze(has_recent_tender, stock, bulk)
-                c1, c2, c3, c4 = st.columns(4)
-                with c1: st.metric("💰 CMP", f"₹{stock['CMP']:.2f}", f"{stock['Change']:+.2f}%")
-                with c2: st.metric("📊 Mkt Cap", f"₹{stock['MarketCap']/1e9:.2f}B")
-                with c3: st.metric("🎯 Score", f"{analysis['Score']}/100")
-                with c4: st.metric("⚠️ Risk", analysis['Risk'])
-                signals_text = "\n".join([f"- {s}" for s in analysis['Signals']]) if analysis['Signals'] else "_No additional signals found._"
-                st.markdown(f"""
-                ### 📋 Recommendation: <span style="color:{'green' if analysis['Score']>=30 else 'orange' if analysis['Score']>=15 else 'red'};">{analysis['Recommendation']}</span>
-                #### Signals:
-                {signals_text}
-                """, unsafe_allow_html=True)
+                stock, stock_err = get_stock(sym)
+                if stock_err:
+                    st.error(f"⚠️ {stock_err}")
+                else:
+                    has_recent_tender = (not tender_hits.empty) and (sym.upper() in tender_hits['Symbol'].str.upper().values)
+                    bulk = bulk_deals[bulk_deals['Symbol'] == sym].iloc[0] if not bulk_deals[bulk_deals['Symbol'] == sym].empty else None
+                    analysis = analyze(has_recent_tender, stock, bulk)
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1: st.metric("💰 CMP", f"₹{stock['CMP']:.2f}", f"{stock['Change']:+.2f}%")
+                    with c2: st.metric("📊 Mkt Cap", f"₹{stock['MarketCap']/1e9:.2f}B")
+                    with c3: st.metric("🎯 Score", f"{analysis['Score']}/100")
+                    with c4: st.metric("⚠️ Risk", analysis['Risk'])
+                    signals_text = "\n".join([f"- {s}" for s in analysis['Signals']]) if analysis['Signals'] else "_No additional signals found._"
+                    st.markdown(f"""
+                    ### 📋 Recommendation: <span style="color:{'green' if analysis['Score']>=30 else 'orange' if analysis['Score']>=15 else 'red'};">{analysis['Recommendation']}</span>
+                    #### Signals:
+                    {signals_text}
+                    """, unsafe_allow_html=True)
 
     with tab4:
         st.markdown("### 🎯 Top Picks")
@@ -329,18 +438,23 @@ def main():
         else:
             recs = []
             for symbol in tender_hits['Symbol'].unique():
-                stock = get_stock(symbol)
+                stock, stock_err = get_stock(symbol)
+                if stock_err or stock is None:
+                    continue  # skip symbols we genuinely can't get real prices for
                 bulk = bulk_deals[bulk_deals['Symbol'] == symbol]
                 a = analyze(True, stock, bulk.iloc[0] if not bulk.empty else None)
                 company = tender_hits[tender_hits['Symbol'] == symbol]['Company'].iloc[0]
                 recs.append({'Company': company, 'Symbol': symbol, 'CMP': stock['CMP'], 'Score': a['Score'], 'Rec': a['Recommendation'], 'Risk': a['Risk']})
-            df = pd.DataFrame(recs).sort_values('Score', ascending=False)
-            def color(val):
-                if 'BUY' in val: return 'background: #00c853; color: white; font-weight: bold;'
-                if 'AVOID' in val: return 'background: #ff1744; color: white; font-weight: bold;'
-                if 'WATCHLIST' in val: return 'background: #ffab00; color: black;'
-                return ''
-            st.dataframe(df.style.map(color, subset=["Rec"]), use_container_width=True)
+            if not recs:
+                st.info("Found tender-win announcements, but couldn't fetch live prices for any of those symbols.")
+            else:
+                df = pd.DataFrame(recs).sort_values('Score', ascending=False)
+                def color(val):
+                    if 'BUY' in val: return 'background: #00c853; color: white; font-weight: bold;'
+                    if 'AVOID' in val: return 'background: #ff1744; color: white; font-weight: bold;'
+                    if 'WATCHLIST' in val: return 'background: #ffab00; color: black;'
+                    return ''
+                st.dataframe(df.style.map(color, subset=["Rec"]), use_container_width=True)
 
     with tab5:
         st.markdown("### 🧠 Smart Money Tracker — Who's Buying, Who's Selling")
@@ -516,6 +630,97 @@ def main():
                     file_name=f"nse_bulk_block_deals_{datetime.now().strftime('%Y%m%d')}.csv",
                     mime="text/csv",
                 )
+
+    with tab6:
+        st.markdown("### 🏆 Top Tender Picks — Fundamentally Vetted")
+        st.caption(
+            "Only companies with a **confirmed** NSE order/tender-win announcement (from the Tenders tab, "
+            f"last {days} days) are considered. Each is checked against real yfinance stock ratios and NSE's own "
+            "quarterly financial filings before ranking — nothing here is estimated or invented."
+        )
+        if tender_hits.empty:
+            st.info(f"No confirmed order/tender-win announcements in the last {days} days — nothing to vet yet. Widen the search window in the sidebar.")
+        else:
+            top_n = st.slider("How many top companies to show", 1, 10, 5, key="top_n_picks")
+            candidates = list(tender_hits['Symbol'].unique())
+            if len(candidates) > 15:
+                st.caption(f"⚠️ {len(candidates)} companies found — evaluating the first 15 to keep load times reasonable.")
+                candidates = candidates[:15]
+
+            evaluated = []
+            with st.spinner(f"Checking fundamentals for {len(candidates)} companies…"):
+                for symbol in candidates:
+                    stock, stock_err = get_stock(symbol)
+                    if stock_err or stock is None:
+                        continue
+                    fin_trend, fin_err = get_financial_trend(symbol)
+                    score, notes = compute_fundamental_score(stock, fin_trend)
+                    company = tender_hits[tender_hits['Symbol'] == symbol]['Company'].iloc[0]
+                    tender_date = tender_hits[tender_hits['Symbol'] == symbol]['Date'].iloc[0]
+                    evaluated.append({
+                        "Symbol": symbol, "Company": company, "Tender Date": tender_date,
+                        "CMP": stock["CMP"], "Change %": stock["Change"], "Fundamental Score": score,
+                        "notes": notes, "fin_trend": fin_trend, "fin_err": fin_err,
+                    })
+
+            if not evaluated:
+                st.info("Found tender-win announcements, but couldn't fetch real fundamentals for any of those symbols.")
+            else:
+                evaluated.sort(key=lambda x: x["Fundamental Score"], reverse=True)
+                top_picks = evaluated[:top_n]
+
+                summary_df = pd.DataFrame([{
+                    "Rank": i + 1, "Company": e["Company"], "Symbol": e["Symbol"],
+                    "Tender Date": e["Tender Date"], "CMP": f"₹{e['CMP']:.2f}",
+                    "Change %": f"{e['Change %']:+.2f}%", "Fundamental Score": f"{e['Fundamental Score']}/100",
+                } for i, e in enumerate(top_picks)])
+                st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+                st.markdown("---")
+                st.markdown("#### Detailed breakdown")
+                for i, e in enumerate(top_picks):
+                    with st.expander(f"#{i+1} — {e['Company']} ({e['Symbol']}) — Score {e['Fundamental Score']}/100"):
+                        st.markdown("**Why it ranks here:**")
+                        if e["notes"]:
+                            for n in e["notes"]:
+                                st.markdown(f"- {n}")
+                        else:
+                            st.markdown("_No real fundamental ratios were available from yfinance for this stock._")
+
+                        st.markdown("**📊 Revenue & Net Profit trend (NSE filings, ₹ Cr):**")
+                        if e["fin_err"] or not e["fin_trend"]:
+                            st.caption(f"⚠️ {e['fin_err'] or 'No financial results data found.'}")
+                        else:
+                            fin_df = pd.DataFrame(e["fin_trend"][:5])
+                            st.dataframe(fin_df, use_container_width=True, hide_index=True)
+
+                        st.markdown("**🧾 Shareholding pattern (latest quarter, as filed with NSE):**")
+                        share_data, share_err = get_shareholding_snapshot(e["Symbol"])
+                        if share_err or not share_data:
+                            st.caption(f"⚠️ {share_err or 'No shareholding data found.'}")
+                        else:
+                            skip_keys = {"symbol", "date"}
+                            share_rows = [{"Field": k, "Value": v} for k, v in share_data.items() if k.lower() not in skip_keys]
+                            st.dataframe(pd.DataFrame(share_rows), use_container_width=True, hide_index=True)
+                            st.caption("As disclosed in NSE's official quarterly shareholding filing — fields are shown exactly as NSE reports them, not relabeled, so nothing is guessed.")
+
+                        st.markdown("**💰 Buying activity since the tender-win announcement:**")
+                        post_deals, post_err = get_post_tender_buying(e["Symbol"], e["Tender Date"])
+                        if post_err:
+                            st.caption(f"⚠️ {post_err}")
+                        elif post_deals.empty:
+                            st.caption("No bulk/block deals recorded for this stock since the announcement.")
+                        else:
+                            buy_side = post_deals[post_deals["Type"].str.startswith("Buy")]
+                            if buy_side.empty:
+                                st.caption("No buy-side bulk/block deals since the announcement (some sell-side activity may exist).")
+                            else:
+                                buyer_summary = buy_side.groupby("Buyer_Seller").agg(
+                                    Value_Cr=("Value_Cr", "sum"), Qty=("Qty", "sum")
+                                ).reset_index().sort_values("Value_Cr", ascending=False)
+                                buyer_summary["Qty"] = buyer_summary["Qty"].map(lambda x: f"{int(x):,}")
+                                buyer_summary.columns = ["Buyer", "Value Bought (₹ Cr)", "Quantity"]
+                                st.dataframe(buyer_summary, use_container_width=True, hide_index=True)
 
 if __name__ == "__main__":
     main()
