@@ -8,3 +8,4 @@ google-generativeai
 groq
 anthropic
 openai
+google-search-results
