@@ -509,7 +509,7 @@ RECENT NEWS HEADLINES:
         elif provider == "groq":
             from groq import Groq
             client = Groq(api_key=api_key)
-            resp = client.chat.completions.create(model="llama-3.1-8b-instant", max_tokens=400, messages=[{"role": "user", "content": prompt}])
+            resp = client.chat.completions.create(model="openai/gpt-oss-20b", max_tokens=400, messages=[{"role": "user", "content": prompt}])
             text = resp.choices[0].message.content
         elif provider == "anthropic":
             import anthropic
