@@ -421,11 +421,41 @@ def compute_fundamental_score(stock, fin_trend):
             notes.append("Latest quarter net profit is negative")
     return min(score, 100), notes
 
-# ============= REAL DATA: COMPANY NEWS (free, no key) =============
+# ============= REAL DATA: COMPANY NEWS =============
 @st.cache_data(ttl=1800)
 def get_company_news(query, max_items=6):
-    """Real recent news headlines via Google News RSS — free, no API key.
-    Returns (list of {title, link, source, date}, error_message)."""
+    """Real recent news headlines. Uses SerpAPI's Google News engine if a
+    SERPAPI_KEY is configured (richer results, real snippets); otherwise
+    falls back to the free Google News RSS feed (no key needed).
+    Returns (list of {title, link, source, date, snippet}, error_message)."""
+    api_key = None
+    try:
+        if "SERPAPI_KEY" in st.secrets:
+            api_key = st.secrets["SERPAPI_KEY"]
+    except Exception:
+        pass
+
+    if api_key:
+        try:
+            from serpapi import GoogleSearch
+            params = {"engine": "google_news", "q": f"{query} stock India", "api_key": api_key}
+            results = GoogleSearch(params).get_dict()
+            news = results.get("news_results", [])
+            if not news:
+                return [], None
+            items = []
+            for n in news[:max_items]:
+                items.append({
+                    "title": n.get("title", "Untitled"),
+                    "link": n.get("link", ""),
+                    "source": (n.get("source", {}) or {}).get("name", "") if isinstance(n.get("source"), dict) else n.get("source", ""),
+                    "date": n.get("date", ""),
+                    "snippet": n.get("snippet", ""),
+                })
+            return items, None
+        except Exception as ex:
+            return [], f"SerpAPI news fetch failed ({ex})."
+
     try:
         import feedparser
         import urllib.parse
@@ -444,13 +474,42 @@ def get_company_news(query, max_items=6):
                 "link": e.get("link", ""),
                 "source": source,
                 "date": e.get("published", ""),
+                "snippet": "",
             })
         return items, None
     except Exception as ex:
         return [], f"Could not fetch news ({ex})."
 
+@st.cache_data(ttl=1800)
+def get_company_web_info(query, max_items=5):
+    """Real general web search snippets about the company via SerpAPI's
+    Google engine — only runs if SERPAPI_KEY is configured. Gives broader
+    context than news alone (e.g. company profile pages, analysis pieces).
+    Returns (list of {title, link, snippet, source}, error_message)."""
+    try:
+        if "SERPAPI_KEY" not in st.secrets:
+            return [], None
+        api_key = st.secrets["SERPAPI_KEY"]
+        from serpapi import GoogleSearch
+        params = {"engine": "google", "q": f"{query} company India NSE", "api_key": api_key, "num": max_items}
+        results = GoogleSearch(params).get_dict()
+        organic = results.get("organic_results", [])
+        if not organic:
+            return [], None
+        items = []
+        for r in organic[:max_items]:
+            items.append({
+                "title": r.get("title", "Untitled"),
+                "link": r.get("link", ""),
+                "snippet": r.get("snippet", ""),
+                "source": r.get("source", ""),
+            })
+        return items, None
+    except Exception as ex:
+        return [], f"SerpAPI web search failed ({ex})."
+
 # ============= OPTIONAL: AI SYNTHESIS (needs the user's own LLM API key) =============
-def get_ai_summary(symbol, company_name, stock, analysis, fin_trend, news_items):
+def get_ai_summary(symbol, company_name, stock, analysis, fin_trend, news_items, web_info=None):
     """Synthesizes the REAL data already gathered above into a plain-English
     paragraph using an LLM. Prefers genuinely free options (Google Gemini,
     then Groq's free open-source Llama models) before paid ones, so this
@@ -483,6 +542,7 @@ def get_ai_summary(symbol, company_name, stock, analysis, fin_trend, news_items)
         )
 
     news_text = "\n".join([f"- {n['title']} ({n['source'] or 'unknown source'}, {n['date']})" for n in news_items[:5]]) or "No recent news found."
+    web_text = "\n".join([f"- {w['title']}: {w['snippet']}" for w in (web_info or [])[:5]]) or "No web search results available."
     fin_text = "\n".join([f"{f['period']}: Revenue ₹{f['revenue_cr']} Cr, Net Profit ₹{f['net_profit_cr']} Cr" for f in fin_trend[:4]]) or "No financial trend data available."
     prompt = f"""You are a cautious equity-research assistant. Using ONLY the facts listed below — never invent numbers or events — write a concise 4-6 sentence plain-English summary for a retail investor deciding whether to research {company_name} ({symbol}) further. Close with one balanced, non-prescriptive takeaway line. Do not give investment advice or a buy/sell instruction.
 
@@ -493,6 +553,8 @@ RECENT QUARTERLY FINANCIALS (NSE filings):
 {fin_text}
 RECENT NEWS HEADLINES:
 {news_text}
+GENERAL WEB SEARCH RESULTS:
+{web_text}
 """
     try:
         if provider == "deepseek":
@@ -608,6 +670,7 @@ def main():
                     analysis = analyze(has_recent_tender, stock, bulk)
                     fin_trend, fin_err = get_financial_trend(sym)
                     news_items, news_err = get_company_news(sym)
+                    web_info, web_err = get_company_web_info(sym)
 
                     c1, c2, c3, c4 = st.columns(4)
                     with c1: st.metric("💰 CMP", f"₹{stock['CMP']:.2f}", f"{stock['Change']:+.2f}%")
@@ -649,11 +712,19 @@ def main():
                         st.info("No recent news found for this symbol.")
                     else:
                         for n in news_items:
-                            st.markdown(f"- [{n['title']}]({n['link']})  <span style='color:#888;font-size:0.8rem;'>· {n['source']} · {n['date']}</span>", unsafe_allow_html=True)
+                            snippet_html = f"<br><span style='color:#555;font-size:0.85rem;'>{n['snippet']}</span>" if n.get('snippet') else ""
+                            st.markdown(f"- [{n['title']}]({n['link']})  <span style='color:#888;font-size:0.8rem;'>· {n['source']} · {n['date']}</span>{snippet_html}", unsafe_allow_html=True)
+
+                    if web_info:
+                        st.markdown("#### 🌐 Web Search Results (SerpAPI)")
+                        for w in web_info:
+                            st.markdown(f"- [{w['title']}]({w['link']})  <span style='color:#888;font-size:0.8rem;'>· {w['source']}</span><br><span style='color:#555;font-size:0.85rem;'>{w['snippet']}</span>", unsafe_allow_html=True)
+                    elif web_err:
+                        st.caption(f"⚠️ {web_err}")
 
                     st.markdown("---")
                     st.markdown("#### 🤖 AI Synthesis")
-                    ai_text, ai_note = get_ai_summary(sym, sym, stock, analysis, fin_trend, news_items)
+                    ai_text, ai_note = get_ai_summary(sym, sym, stock, analysis, fin_trend, news_items, web_info)
                     if ai_text:
                         st.info(ai_text)
                         st.caption("Generated by an LLM strictly from the real data shown above — not an independent data source.")
