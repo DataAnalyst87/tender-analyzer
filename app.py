@@ -460,7 +460,9 @@ def get_ai_summary(symbol, company_name, stock, analysis, fin_trend, news_items)
     api_key = None
     provider = None
     try:
-        if "GEMINI_API_KEY" in st.secrets:
+        if "DEEPSEEK_API_KEY" in st.secrets:
+            api_key, provider = st.secrets["DEEPSEEK_API_KEY"], "deepseek"
+        elif "GEMINI_API_KEY" in st.secrets:
             api_key, provider = st.secrets["GEMINI_API_KEY"], "gemini"
         elif "GROQ_API_KEY" in st.secrets:
             api_key, provider = st.secrets["GROQ_API_KEY"], "groq"
@@ -473,8 +475,8 @@ def get_ai_summary(symbol, company_name, stock, analysis, fin_trend, news_items)
 
     if not api_key:
         return None, (
-            "AI synthesis is off. To enable it **for free**, add **GEMINI_API_KEY** "
-            "(from [Google AI Studio](https://aistudio.google.com/apikey), no credit card needed) "
+            "AI synthesis is off. To enable it, add **DEEPSEEK_API_KEY**, **GEMINI_API_KEY** "
+            "(from [Google AI Studio](https://aistudio.google.com/apikey), free, no credit card needed), "
             "or **GROQ_API_KEY** (from [console.groq.com](https://console.groq.com/keys), also free, "
             "serves open-source Llama models) under your Streamlit Cloud app → Settings → Secrets. "
             "Paid ANTHROPIC_API_KEY / OPENAI_API_KEY also work if you prefer those."
@@ -493,7 +495,12 @@ RECENT NEWS HEADLINES:
 {news_text}
 """
     try:
-        if provider == "gemini":
+        if provider == "deepseek":
+            import openai
+            client = openai.OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+            resp = client.chat.completions.create(model="deepseek-chat", max_tokens=400, messages=[{"role": "user", "content": prompt}])
+            text = resp.choices[0].message.content
+        elif provider == "gemini":
             import google.generativeai as genai
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel("gemini-2.5-flash")
