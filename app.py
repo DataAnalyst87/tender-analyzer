@@ -421,6 +421,103 @@ def compute_fundamental_score(stock, fin_trend):
             notes.append("Latest quarter net profit is negative")
     return min(score, 100), notes
 
+# ============= REAL DATA: COMPANY NEWS (free, no key) =============
+@st.cache_data(ttl=1800)
+def get_company_news(query, max_items=6):
+    """Real recent news headlines via Google News RSS — free, no API key.
+    Returns (list of {title, link, source, date}, error_message)."""
+    try:
+        import feedparser
+        import urllib.parse
+        q = urllib.parse.quote(f"{query} stock India")
+        url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
+        feed = feedparser.parse(url)
+        if not feed.entries:
+            return [], None
+        items = []
+        for e in feed.entries[:max_items]:
+            source = ""
+            if isinstance(e.get("source"), dict):
+                source = e.get("source", {}).get("title", "")
+            items.append({
+                "title": e.get("title", "Untitled"),
+                "link": e.get("link", ""),
+                "source": source,
+                "date": e.get("published", ""),
+            })
+        return items, None
+    except Exception as ex:
+        return [], f"Could not fetch news ({ex})."
+
+# ============= OPTIONAL: AI SYNTHESIS (needs the user's own LLM API key) =============
+def get_ai_summary(symbol, company_name, stock, analysis, fin_trend, news_items):
+    """Synthesizes the REAL data already gathered above into a plain-English
+    paragraph using an LLM. Prefers genuinely free options (Google Gemini,
+    then Groq's free open-source Llama models) before paid ones, so this
+    works with zero cost for most usage. Requires the deployer's own key in
+    Streamlit Cloud's Secrets — nothing is billed on your behalf without
+    one. Returns (text_or_None, note)."""
+    api_key = None
+    provider = None
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            api_key, provider = st.secrets["GEMINI_API_KEY"], "gemini"
+        elif "GROQ_API_KEY" in st.secrets:
+            api_key, provider = st.secrets["GROQ_API_KEY"], "groq"
+        elif "ANTHROPIC_API_KEY" in st.secrets:
+            api_key, provider = st.secrets["ANTHROPIC_API_KEY"], "anthropic"
+        elif "OPENAI_API_KEY" in st.secrets:
+            api_key, provider = st.secrets["OPENAI_API_KEY"], "openai"
+    except Exception:
+        pass
+
+    if not api_key:
+        return None, (
+            "AI synthesis is off. To enable it **for free**, add **GEMINI_API_KEY** "
+            "(from [Google AI Studio](https://aistudio.google.com/apikey), no credit card needed) "
+            "or **GROQ_API_KEY** (from [console.groq.com](https://console.groq.com/keys), also free, "
+            "serves open-source Llama models) under your Streamlit Cloud app → Settings → Secrets. "
+            "Paid ANTHROPIC_API_KEY / OPENAI_API_KEY also work if you prefer those."
+        )
+
+    news_text = "\n".join([f"- {n['title']} ({n['source'] or 'unknown source'}, {n['date']})" for n in news_items[:5]]) or "No recent news found."
+    fin_text = "\n".join([f"{f['period']}: Revenue ₹{f['revenue_cr']} Cr, Net Profit ₹{f['net_profit_cr']} Cr" for f in fin_trend[:4]]) or "No financial trend data available."
+    prompt = f"""You are a cautious equity-research assistant. Using ONLY the facts listed below — never invent numbers or events — write a concise 4-6 sentence plain-English summary for a retail investor deciding whether to research {company_name} ({symbol}) further. Close with one balanced, non-prescriptive takeaway line. Do not give investment advice or a buy/sell instruction.
+
+STOCK DATA: CMP ₹{stock['CMP']}, day change {stock['Change']}%, Market Cap ₹{stock['MarketCap']/1e7:.0f} Cr, P/E {stock.get('PE')}, ROE {stock.get('ROE')}, Debt/Equity {stock.get('DebtToEquity')}, Profit Margin {stock.get('ProfitMargin')}, Sector {stock.get('Sector')}
+COMPOSITE SCORE: {analysis['Score']}/100, Recommendation label: {analysis['Recommendation']}, Risk: {analysis['Risk']}
+SIGNALS TRIGGERED: {', '.join(analysis['Signals']) or 'None'}
+RECENT QUARTERLY FINANCIALS (NSE filings):
+{fin_text}
+RECENT NEWS HEADLINES:
+{news_text}
+"""
+    try:
+        if provider == "gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            resp = model.generate_content(prompt)
+            text = resp.text
+        elif provider == "groq":
+            from groq import Groq
+            client = Groq(api_key=api_key)
+            resp = client.chat.completions.create(model="llama-3.1-8b-instant", max_tokens=400, messages=[{"role": "user", "content": prompt}])
+            text = resp.choices[0].message.content
+        elif provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            resp = client.messages.create(model="claude-sonnet-4-5", max_tokens=400, messages=[{"role": "user", "content": prompt}])
+            text = "".join(b.text for b in resp.content if hasattr(b, "text"))
+        else:
+            import openai
+            client = openai.OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(model="gpt-4o-mini", max_tokens=400, messages=[{"role": "user", "content": prompt}])
+            text = resp.choices[0].message.content
+        return text, None
+    except Exception as e:
+        return None, f"AI synthesis failed ({e})."
+
 # ============= MAIN UI =============
 def main():
     st.markdown('<div class="main-header"><h1>📊 Tender Analyzer Pro</h1><p>Live Tender Scanner • Bulk Deal Tracker • AI Analysis</p><p style="font-size:0.9rem;opacity:0.8;">📅 {} • Powered by AI</p></div>'.format(datetime.now().strftime('%d %B %Y')), unsafe_allow_html=True)
@@ -486,10 +583,15 @@ def main():
             st.caption("👉 For buyer/seller leaderboards, quantities, and full accumulation/distribution analysis, see the **🧠 Smart Money Tracker** tab.")
 
     with tab3:
-        st.markdown("### 📊 AI Analysis Report")
+        st.markdown("### 📊 AI Company Analysis Report")
+        st.caption(
+            "Enter any NSE symbol for a full picture: live price + score, real fundamentals (yfinance), "
+            "real quarterly financials (NSE filings), real recent news (Google News), and an optional "
+            "AI-written synthesis of all of the above."
+        )
         sym = st.text_input("🔍 Enter Symbol (e.g., LT, IRFC, HAL)", "LT")
         if st.button("🚀 Analyze Now", use_container_width=True):
-            with st.spinner("🔄 Analyzing..."):
+            with st.spinner("🔄 Gathering live data…"):
                 stock, stock_err = get_stock(sym)
                 if stock_err:
                     st.error(f"⚠️ {stock_err}")
@@ -497,6 +599,9 @@ def main():
                     has_recent_tender = (not tender_hits.empty) and (sym.upper() in tender_hits['Symbol'].str.upper().values)
                     bulk = bulk_deals[bulk_deals['Symbol'] == sym].iloc[0] if not bulk_deals[bulk_deals['Symbol'] == sym].empty else None
                     analysis = analyze(has_recent_tender, stock, bulk)
+                    fin_trend, fin_err = get_financial_trend(sym)
+                    news_items, news_err = get_company_news(sym)
+
                     c1, c2, c3, c4 = st.columns(4)
                     with c1: st.metric("💰 CMP", f"₹{stock['CMP']:.2f}", f"{stock['Change']:+.2f}%")
                     with c2: st.metric("📊 Mkt Cap", f"₹{stock['MarketCap']/1e9:.2f}B")
@@ -509,6 +614,44 @@ def main():
                     #### Signals:
                     {signals_text}
                     """, unsafe_allow_html=True)
+
+                    st.markdown("---")
+                    fc1, fc2 = st.columns(2)
+                    with fc1:
+                        st.markdown("#### 🧮 Fundamentals (yfinance)")
+                        pe = stock.get('PE'); roe = stock.get('ROE'); d2e = stock.get('DebtToEquity'); pm = stock.get('ProfitMargin')
+                        st.markdown(f"""
+                        - **Sector:** {stock.get('Sector', 'N/A')}
+                        - **P/E Ratio:** {f'{pe:.1f}' if pe else 'N/A'}
+                        - **ROE:** {f'{roe*100:.1f}%' if roe is not None else 'N/A'}
+                        - **Debt/Equity:** {f'{d2e:.0f}' if d2e is not None else 'N/A'}
+                        - **Profit Margin:** {f'{pm*100:.1f}%' if pm is not None else 'N/A'}
+                        """)
+                    with fc2:
+                        st.markdown("#### 📈 Quarterly Revenue & Net Profit (NSE, ₹ Cr)")
+                        if fin_err or not fin_trend:
+                            st.caption(f"⚠️ {fin_err or 'No financial results data found.'}")
+                        else:
+                            st.dataframe(pd.DataFrame(fin_trend[:4]), use_container_width=True, hide_index=True)
+
+                    st.markdown("---")
+                    st.markdown("#### 📰 Recent News")
+                    if news_err:
+                        st.caption(f"⚠️ {news_err}")
+                    elif not news_items:
+                        st.info("No recent news found for this symbol.")
+                    else:
+                        for n in news_items:
+                            st.markdown(f"- [{n['title']}]({n['link']})  <span style='color:#888;font-size:0.8rem;'>· {n['source']} · {n['date']}</span>", unsafe_allow_html=True)
+
+                    st.markdown("---")
+                    st.markdown("#### 🤖 AI Synthesis")
+                    ai_text, ai_note = get_ai_summary(sym, sym, stock, analysis, fin_trend, news_items)
+                    if ai_text:
+                        st.info(ai_text)
+                        st.caption("Generated by an LLM strictly from the real data shown above — not an independent data source.")
+                    else:
+                        st.warning(f"⚠️ {ai_note}")
 
     with tab4:
         st.markdown("### 🎯 Top Picks")
