@@ -324,7 +324,8 @@ def analyze(has_recent_tender, stock, bulk):
 
 @st.cache_data(ttl=1800)
 def get_financial_trend(symbol):
-    """Real quarterly revenue/net-profit trend from NSE's own filings.
+    """Real quarterly revenue/net-profit trend from NSE's own filings,
+    sorted so the most recent quarter is always first.
     Returns (list of {period, revenue_cr, net_profit_cr}, error_message)."""
     try:
         from nse import NSE
@@ -337,22 +338,32 @@ def get_financial_trend(symbol):
         out = []
         for row in rows:
             try:
+                period_raw = row.get("re_to_dt", "N/A")
                 out.append({
-                    "period": row.get("re_to_dt", "N/A"),
+                    "period": period_raw,
+                    "_period_dt": pd.to_datetime(period_raw, errors="coerce", dayfirst=True),
                     "revenue_cr": round(float(row.get("re_total_inc", 0)) / 100, 1),
                     "net_profit_cr": round(float(row.get("re_net_profit", 0)) / 100, 1),
                 })
             except (TypeError, ValueError):
                 continue
+        # Guarantee newest-first regardless of the order NSE returned rows in
+        out.sort(key=lambda r: (r["_period_dt"] if pd.notna(r["_period_dt"]) else pd.Timestamp.min), reverse=True)
+        for r in out:
+            del r["_period_dt"]
         return out, None
     except Exception as e:
         return [], f"Could not fetch financial results ({e})."
 
 @st.cache_data(ttl=1800)
-def get_shareholding_snapshot(symbol):
-    """Real, latest-quarter shareholding pattern as filed with NSE (Promoter/
-    Public breakdown at minimum; other categories included as NSE reports
-    them — field names aren't force-mapped to avoid mislabeling)."""
+def get_shareholding_trend(symbol, quarters=4):
+    """Real shareholding pattern for the last N quarters, as filed with NSE
+    (Promoter/Public breakdown at minimum; other categories — FII, DII,
+    Mutual Fund, Retail — included exactly as NSE itemizes them for this
+    company. Field names aren't force-mapped or guessed to avoid
+    mislabeling; if NSE doesn't break out a category separately for a
+    given company, it simply won't have its own row here).
+    Returns (list of quarterly dicts, error_message), newest quarter first."""
     try:
         from nse import NSE
         import tempfile
@@ -360,11 +371,33 @@ def get_shareholding_snapshot(symbol):
             data = nse_client.shareholding(symbol)
         records = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
         if not records:
-            return None, "No shareholding pattern data found."
-        latest = records[0]
-        return latest, None
+            return [], "No shareholding pattern data found."
+        # NSE returns latest-quarter-first already; sort defensively anyway
+        try:
+            records = sorted(records, key=lambda r: pd.to_datetime(r.get("date", ""), errors="coerce"), reverse=True)
+        except Exception:
+            pass
+        return records[:quarters], None
     except Exception as e:
-        return None, f"Could not fetch shareholding pattern ({e})."
+        return [], f"Could not fetch shareholding pattern ({e})."
+
+def build_shareholding_table(records):
+    """Transpose quarterly shareholding records into a Field x Quarter table
+    for display — every field NSE actually returned, nothing invented."""
+    if not records:
+        return pd.DataFrame()
+    skip_keys = {"symbol"}
+    quarters = [r.get("date", f"Q{i+1}") for i, r in enumerate(records)]
+    all_fields = []
+    seen = set()
+    for r in records:
+        for k in r.keys():
+            if k.lower() not in skip_keys and k != "date" and k not in seen:
+                seen.add(k); all_fields.append(k)
+    table = {"Field": all_fields}
+    for q, r in zip(quarters, records):
+        table[q] = [r.get(f, "") for f in all_fields]
+    return pd.DataFrame(table)
 
 @st.cache_data(ttl=1800)
 def get_post_tender_buying(symbol, tender_date_str):
@@ -669,6 +702,7 @@ def main():
                     bulk = bulk_deals[bulk_deals['Symbol'] == sym].iloc[0] if not bulk_deals[bulk_deals['Symbol'] == sym].empty else None
                     analysis = analyze(has_recent_tender, stock, bulk)
                     fin_trend, fin_err = get_financial_trend(sym)
+                    share_records, share_err = get_shareholding_trend(sym, quarters=4)
                     news_items, news_err = get_company_news(sym)
                     web_info, web_err = get_company_web_info(sym)
 
@@ -698,11 +732,27 @@ def main():
                         - **Profit Margin:** {f'{pm*100:.1f}%' if pm is not None else 'N/A'}
                         """)
                     with fc2:
-                        st.markdown("#### 📈 Quarterly Revenue & Net Profit (NSE, ₹ Cr)")
+                        st.markdown("#### 📈 Quarterly Revenue & Net Profit (NSE, ₹ Cr) — last 4 quarters")
                         if fin_err or not fin_trend:
                             st.caption(f"⚠️ {fin_err or 'No financial results data found.'}")
                         else:
-                            st.dataframe(pd.DataFrame(fin_trend[:4]), use_container_width=True, hide_index=True)
+                            fdisp = pd.DataFrame(fin_trend[:4]).rename(columns={
+                                "period": "Quarter Ending", "revenue_cr": "Revenue (₹ Cr)", "net_profit_cr": "Net Profit/Loss (₹ Cr)"
+                            })
+                            st.dataframe(fdisp, use_container_width=True, hide_index=True)
+                            st.caption("Net Profit/Loss is negative when the company reported a loss that quarter — shown exactly as filed, not adjusted.")
+
+                    st.markdown("---")
+                    st.markdown("#### 🧾 Shareholding Pattern — last 4 quarters (Promoter / FII / DII / Mutual Fund / Retail)")
+                    if share_err or not share_records:
+                        st.caption(f"⚠️ {share_err or 'No shareholding data found.'}")
+                    else:
+                        st.dataframe(build_shareholding_table(share_records), use_container_width=True, hide_index=True)
+                        st.caption(
+                            "As disclosed in NSE's official quarterly shareholding filings — every field is shown exactly as "
+                            "NSE reports it per quarter. If NSE doesn't itemize FII/DII/Mutual Fund/Retail separately for this "
+                            "company, they won't appear as separate rows — nothing here is guessed or relabeled."
+                        )
 
                     st.markdown("---")
                     st.markdown("#### 📰 Recent News")
@@ -1013,15 +1063,13 @@ def main():
                             fin_df = pd.DataFrame(e["fin_trend"][:5])
                             st.dataframe(fin_df, use_container_width=True, hide_index=True)
 
-                        st.markdown("**🧾 Shareholding pattern (latest quarter, as filed with NSE):**")
-                        share_data, share_err = get_shareholding_snapshot(e["Symbol"])
-                        if share_err or not share_data:
+                        st.markdown("**🧾 Shareholding pattern (last 4 quarters, as filed with NSE):**")
+                        share_records, share_err = get_shareholding_trend(e["Symbol"], quarters=4)
+                        if share_err or not share_records:
                             st.caption(f"⚠️ {share_err or 'No shareholding data found.'}")
                         else:
-                            skip_keys = {"symbol", "date"}
-                            share_rows = [{"Field": k, "Value": v} for k, v in share_data.items() if k.lower() not in skip_keys]
-                            st.dataframe(pd.DataFrame(share_rows), use_container_width=True, hide_index=True)
-                            st.caption("As disclosed in NSE's official quarterly shareholding filing — fields are shown exactly as NSE reports them, not relabeled, so nothing is guessed.")
+                            st.dataframe(build_shareholding_table(share_records), use_container_width=True, hide_index=True)
+                            st.caption("As disclosed in NSE's official quarterly shareholding filings — fields shown exactly as NSE reports them per quarter, not relabeled, so nothing is guessed.")
 
                         st.markdown("**💰 Buying activity since the tender-win announcement:**")
                         post_deals, post_err = get_post_tender_buying(e["Symbol"], e["Tender Date"])
