@@ -3,3 +3,8 @@ pandas
 yfinance
 plotly
 nse[local]
+feedparser
+google-generativeai
+groq
+anthropic
+openai
